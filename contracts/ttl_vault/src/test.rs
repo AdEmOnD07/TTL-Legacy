@@ -7196,6 +7196,83 @@ fn test_get_multisig_proposal_status_rejected() {
     assert_eq!(status, ProposalStatus::Rejected);
 }
 
+#[test]
+fn test_owner_can_cancel_pending_multisig_proposal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer], &2u32);
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+
+    client
+        .cancel_multisig_proposal(&vault_id, &proposal_id, &owner)
+        .unwrap();
+
+    assert_eq!(
+        client.get_multisig_proposal_status(&vault_id, &proposal_id),
+        ProposalStatus::Cancelled
+    );
+    assert!(client
+        .try_cancel_multisig_proposal(&vault_id, &proposal_id, &owner)
+        .is_err());
+    assert!(client.list_open_proposals(&vault_id).is_empty());
+}
+
+#[test]
+fn test_approve_prunes_expired_multisig_proposal() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    client.configure_multisig(
+        &vault_id,
+        &owner,
+        &soroban_sdk::vec![&env, signer.clone()],
+        &2u32,
+    );
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + MULTISIG_PROPOSAL_EXPIRY + 1);
+
+    client
+        .approve_multisig(&vault_id, &proposal_id, &signer)
+        .unwrap();
+
+    assert!(client.get_multisig_proposal(&vault_id, &proposal_id).is_none());
+    assert!(client.list_open_proposals(&vault_id).is_empty());
+}
+
+#[test]
+fn test_list_open_proposals_prunes_expired_entries() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let signer = Address::generate(&env);
+    client.configure_multisig(&vault_id, &owner, &soroban_sdk::vec![&env, signer], &2u32);
+    let proposal_id = client.propose_multisig(
+        &vault_id,
+        &owner,
+        &MultiSigOperation::CancelVault,
+        &Bytes::new(&env),
+        &None,
+    );
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + MULTISIG_PROPOSAL_EXPIRY + 1);
+
+    assert!(client.list_open_proposals(&vault_id).is_empty());
+    assert!(client.get_multisig_proposal(&vault_id, &proposal_id).is_none());
+}
+
 // ── Issue #1138: 2FA-gated withdrawals ───────────────────────────────────────
 
 #[test]
