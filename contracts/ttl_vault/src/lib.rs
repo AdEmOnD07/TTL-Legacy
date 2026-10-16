@@ -10010,11 +10010,59 @@ impl TtlVaultContract {
     /// the persistent storage TTL is automatically updated (issue #297).
     fn save_vault(env: &Env, vault_id: u64, vault: &Vault) {
         let key = StorageKey::Vault(vault_id);
+        let ttl_changed = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, Vault>(&key)
+            .map_or(false, |previous| {
+                previous.last_check_in != vault.last_check_in
+                    || previous.check_in_interval != vault.check_in_interval
+            });
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage().persistent().set(&key, vault);
         env.storage()
             .persistent()
             .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        if ttl_changed && vault.status == ReleaseStatus::Locked {
+            let remaining = Self::effective_ttl_remaining(env, vault_id, vault);
+            Self::emit_low_ttl_warning_if_needed(env, vault_id, remaining);
+        }
+    }
+
+    fn effective_ttl_remaining(env: &Env, vault_id: u64, vault: &Vault) -> u64 {
+        let now = env.ledger().timestamp();
+        let base_deadline = vault
+            .last_check_in
+            .saturating_add(vault.check_in_interval);
+        let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, HibernationEntry>(&StorageKey::Hibernation(vault_id))
+        else {
+            return base_deadline.saturating_sub(now);
+        };
+        let extended_deadline = base_deadline.saturating_add(entry.duration_seconds);
+        let hibernation_end = entry.started_at.saturating_add(entry.duration_seconds);
+        let effective_deadline = if now < hibernation_end {
+            extended_deadline.max(hibernation_end)
+        } else {
+            extended_deadline
+        };
+        effective_deadline.saturating_sub(now)
+    }
+
+    fn emit_low_ttl_warning_if_needed(env: &Env, vault_id: u64, ttl: u64) -> bool {
+        let threshold: u64 = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, u64>(&StorageKey::VaultLowTtlThreshold(vault_id))
+            .unwrap_or(604_800);
+        let below_threshold = ttl < threshold;
+        if below_threshold {
+            env.events()
+                .publish((LOW_TTL_WARNING_TOPIC, vault_id), (ttl, threshold));
+        }
+        below_threshold
     }
 
     fn load_beneficiary_vault_ids(env: &Env, beneficiary: &Address) -> Vec<u64> {
@@ -15484,6 +15532,52 @@ impl TtlVaultContract {
 
     // ── Hibernation ──────────────────────────────────────────────────────────
 
+    /// Sets the maximum hibernation duration for one vault.
+    /// The vault owner or protocol admin may set a value between the protocol minimum
+    /// and the hard maximum; the hard maximum applies when no override is stored.
+    pub fn set_max_hibernation_duration(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        max_duration_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner && caller != Self::get_admin(env.clone()) {
+            return Err(ContractError::NotOwner);
+        }
+        if max_duration_seconds < MIN_HIBERNATION_SECONDS {
+            return Err(ContractError::HibernationDurationTooShort);
+        }
+        if max_duration_seconds > MAX_HIBERNATION_SECONDS {
+            return Err(ContractError::HibernationDurationTooLong);
+        }
+
+        let key = StorageKey::MaxHibernationDuration(vault_id);
+        env.storage().persistent().set(&key, &max_duration_seconds);
+        env.storage().persistent().extend_ttl(
+            &key,
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(
+                vault
+                    .check_in_interval
+                    .saturating_add(max_duration_seconds),
+            ),
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Returns the configured hibernation limit, or the protocol hard maximum.
+    pub fn get_max_hibernation_duration(env: Env, vault_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::MaxHibernationDuration(vault_id))
+            .unwrap_or(MAX_HIBERNATION_SECONDS)
+    }
+
     /// Puts a vault into hibernation for `duration_seconds`.
     ///
     /// During hibernation the owner is not required to check in — the vault's
@@ -15524,6 +15618,9 @@ impl TtlVaultContract {
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
+        if duration_seconds > Self::get_max_hibernation_duration(env.clone(), vault_id) {
+            return Err(ContractError::HibernationDurationTooLong);
+        }
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
@@ -15543,15 +15640,19 @@ impl TtlVaultContract {
                 return Err(ContractError::AlreadyHibernating);
             }
         }
+        let remaining_ttl_at_entry = Self::effective_ttl_remaining(&env, vault_id, &vault);
         let entry = HibernationEntry {
             started_at: now,
             duration_seconds,
+            remaining_ttl_at_entry,
         };
-        let ttl = vault_ttl_ledgers(vault.check_in_interval + duration_seconds);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval.saturating_add(duration_seconds));
         env.storage().persistent().set(&hib_key, &entry);
         env.storage()
             .persistent()
             .extend_ttl(&hib_key, VAULT_TTL_THRESHOLD, ttl);
+        let effective_ttl = Self::effective_ttl_remaining(&env, vault_id, &vault);
+        Self::emit_low_ttl_warning_if_needed(&env, vault_id, effective_ttl);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -15591,28 +15692,21 @@ impl TtlVaultContract {
             .get::<StorageKey, HibernationEntry>(&hib_key)
             .ok_or(ContractError::NotHibernating)?;
         let now = env.ledger().timestamp();
-        // Credit elapsed hibernation time so the TTL countdown resumes correctly.
-        let elapsed = now
-            .saturating_sub(entry.started_at)
-            .min(entry.duration_seconds);
-        vault.last_check_in = vault.last_check_in.saturating_add(elapsed);
+        let remaining_ttl = entry.remaining_ttl_at_entry;
+        vault.last_check_in = if remaining_ttl >= vault.check_in_interval {
+            now.saturating_add(remaining_ttl - vault.check_in_interval)
+        } else {
+            now.saturating_sub(vault.check_in_interval - remaining_ttl)
+        };
         env.storage().persistent().remove(&hib_key);
         Self::save_vault(&env, vault_id, &vault);
-
-        // Calculate the new TTL remaining after exiting hibernation
-        let deadline = vault.last_check_in + vault.check_in_interval;
-        let new_ttl_remaining = if now >= deadline {
-            0u64
-        } else {
-            deadline - now
-        };
 
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish(
             (HIBERNATION_EXITED_TOPIC, vault_id),
-            (now, new_ttl_remaining),
+            (now, remaining_ttl),
         );
         Ok(())
     }
@@ -18538,21 +18632,8 @@ impl TtlVaultContract {
             return false;
         }
 
-        let threshold: u64 = env
-            .storage()
-            .persistent()
-            .get::<StorageKey, u64>(&StorageKey::VaultLowTtlThreshold(vault_id))
-            .unwrap_or(604_800); // default: 7 days
-
-        let ttl = Self::get_ttl_remaining(env.clone(), vault_id).unwrap_or(0);
-        let below_threshold = ttl < threshold;
-
-        if below_threshold {
-            env.events()
-                .publish((LOW_TTL_WARNING_TOPIC, vault_id), (ttl, threshold));
-        }
-
-        below_threshold
+        let ttl = Self::effective_ttl_remaining(&env, vault_id, &vault);
+        Self::emit_low_ttl_warning_if_needed(&env, vault_id, ttl)
     }
 
     // ── Issue 4: batch_check_in with custom extension_amounts ─────────────────
