@@ -993,6 +993,15 @@ pub struct VaultStatusSummary {
 
 #[contracttype]
 #[derive(Clone)]
+pub struct VaultHealthSummary {
+    pub last_check_in: Option<u64>,
+    pub ttl_remaining: Option<u64>,
+    pub balance: i128,
+    pub is_paused: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct Vault {
     pub owner: Address,
     /// Primary beneficiary kept for backwards-compatible single-beneficiary reads.

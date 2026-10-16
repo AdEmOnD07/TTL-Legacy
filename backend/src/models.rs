@@ -857,6 +857,8 @@ pub struct VestingBonusConfig {
 pub struct ClaimBonusRequest {
     /// Caller must be the beneficiary; this is the Stellar account address.
     pub beneficiary: String,
+    /// Base64-encoded, beneficiary-signed Soroban transaction XDR.
+    pub transaction_xdr: String,
     /// Optional memo for the claim transaction.
     pub memo: Option<String>,
 }
@@ -867,7 +869,7 @@ pub struct ClaimBonusResponse {
     pub vault_id: String,
     pub claimed_amount: i128,
     pub bonus_amount: i128,
-    pub transaction_hash: String,
+    pub tx_hash: String,
     pub claimed_at: DateTime<Utc>,
 }
 
