@@ -518,6 +518,7 @@ pub enum StorageKey {
     WithdrawalHistoryLen(u64),
     // Issue #572: Withdrawal Dispute
     WithdrawalDisputes(u64),
+    WithdrawalDisputeAuditIndices(u64),
     // Issue #565: withdrawal scheduling validation
     WithdrawalScheduleValidation(u64),
     // Issue #566: withdrawal limits by time

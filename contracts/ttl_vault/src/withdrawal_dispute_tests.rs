@@ -117,6 +117,40 @@ fn test_dispute_withdrawal_creates_dispute_entry() {
 }
 
 #[test]
+fn test_batch_withdrawals_at_same_timestamp_can_be_disputed_individually() {
+    let f = setup_with_withdrawal();
+    let destination_a = Address::generate(&f.env);
+    let destination_b = Address::generate(&f.env);
+
+    f.client.batch_withdraw(
+        &soroban_sdk::vec![
+            &f.env,
+            BatchWithdrawal {
+                vault_id: f.vault_id,
+                destination: destination_a,
+                amount: 100i128,
+            },
+            BatchWithdrawal {
+                vault_id: f.vault_id,
+                destination: destination_b,
+                amount: 200i128,
+            },
+        ],
+        &f.owner,
+    );
+
+    let reason = String::from_str(&f.env, "Batch withdrawal dispute");
+    f.client
+        .dispute_withdrawal(&f.vault_id, &f.owner, &1u32, &reason);
+    f.client
+        .dispute_withdrawal(&f.vault_id, &f.owner, &2u32, &reason);
+
+    let disputes = f.client.get_withdrawal_disputes(&f.vault_id);
+    assert_eq!(disputes.len(), 2u32);
+    assert_eq!(disputes.get(0).unwrap().withdrawal_timestamp, disputes.get(1).unwrap().withdrawal_timestamp);
+}
+
+#[test]
 fn test_dispute_withdrawal_expires_at_withdrawal_plus_24h() {
     let f = setup_with_withdrawal();
 
