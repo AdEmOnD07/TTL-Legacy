@@ -543,6 +543,96 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/vaults/{vault_id}/hibernation:
+    parameters:
+      - name: vault_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: The vault ID
+    get:
+      summary: Get vault hibernation status
+      operationId: getVaultHibernation
+      tags:
+        - Vaults
+      responses:
+        '200':
+          description: Current hibernation entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HibernationEntry'
+        '404':
+          description: Vault or hibernation entry not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Enter vault hibernation
+      operationId: enterVaultHibernation
+      tags:
+        - Vaults
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HibernationRequest'
+      responses:
+        '201':
+          description: Hibernation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HibernationEntry'
+        '400':
+          description: Invalid hibernation duration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the vault owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Exit vault hibernation
+      operationId: exitVaultHibernation
+      tags:
+        - Vaults
+      parameters:
+        - name: caller
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Vault owner address
+      responses:
+        '204':
+          description: Hibernation ended and the entry TTL was restored
+        '403':
+          description: Caller is not the vault owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault or hibernation entry not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/vaults/{vault_id}/share:
     post:
       summary: Share vault access
@@ -1043,6 +1133,42 @@ components:
         - check_in_interval
         - created_at
         - status
+
+    HibernationRequest:
+      type: object
+      properties:
+        caller:
+          type: string
+          description: Vault owner address
+        duration_seconds:
+          type: integer
+          format: int64
+          minimum: 3600
+          maximum: 15552000
+          description: Requested duration, bounded by the per-vault maximum
+      required:
+        - caller
+        - duration_seconds
+
+    HibernationEntry:
+      type: object
+      properties:
+        started_at:
+          type: integer
+          format: int64
+          description: Ledger timestamp when hibernation started
+        duration_seconds:
+          type: integer
+          format: int64
+          description: Configured hibernation duration in seconds
+        remaining_ttl_at_entry:
+          type: integer
+          format: int64
+          description: TTL remaining when hibernation started, restored on exit
+      required:
+        - started_at
+        - duration_seconds
+        - remaining_ttl_at_entry
 
     SearchQuery:
       type: object
