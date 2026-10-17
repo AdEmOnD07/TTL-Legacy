@@ -892,6 +892,129 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/vaults/{vault_id}/vesting/bonus:
+    get:
+      summary: Get vesting bonus configuration
+      operationId: getVestingBonus
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Vesting bonus configuration for the vault
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [vault_id, configured]
+                properties:
+                  vault_id:
+                    type: string
+                  configured:
+                    type: boolean
+                  bonus_bps:
+                    type: integer
+                    nullable: true
+                  on_time_window_seconds:
+                    type: integer
+                    format: int64
+                    nullable: true
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/vaults/{vault_id}/vesting/claim-bonus:
+    post:
+      summary: Submit a beneficiary-signed vesting bonus claim
+      description: >
+        Relays the signed Soroban transaction to the configured RPC endpoint and
+        returns the transaction hash reported by the network. The backend does
+        not sign transactions on behalf of beneficiaries.
+      operationId: claimVestingBonus
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [beneficiary, transaction_xdr]
+              properties:
+                beneficiary:
+                  type: string
+                  description: Stellar account address of the vault beneficiary
+                transaction_xdr:
+                  type: string
+                  maxLength: 2000000
+                  description: Base64-encoded, beneficiary-signed Soroban transaction XDR
+                memo:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Transaction accepted by Soroban RPC
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [vault_id, claimed_amount, bonus_amount, tx_hash, claimed_at]
+                properties:
+                  vault_id:
+                    type: string
+                  claimed_amount:
+                    type: integer
+                    format: int64
+                  bonus_amount:
+                    type: integer
+                    format: int64
+                  tx_hash:
+                    type: string
+                    pattern: '^[a-fA-F0-9]{64}$'
+                  claimed_at:
+                    type: string
+                    format: date-time
+        '403':
+          description: Caller is not the vault beneficiary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault or vesting bonus configuration not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid transaction request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: Soroban RPC rejected the transaction or could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Soroban RPC URL is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   schemas:
     ErrorResponse:

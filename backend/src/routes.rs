@@ -332,6 +332,30 @@ pub async fn delete_subscription(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// POST /api/vaults/:vault_id/vesting/claim-bonus
+pub async fn claim_vesting_bonus(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    axum::extract::Path(vault_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<ClaimBonusRequest>,
+) -> Result<axum::Json<crate::models::ClaimBonusResponse>, AppError> {
+    let rpc_url = std::env::var("SOROBAN_RPC_URL")
+        .or_else(|_| std::env::var("STELLAR_RPC_URL"))
+        .ok();
+    let response =
+        claim_vesting_bonus_handler(db, headers, &vault_id, body, rpc_url.as_deref()).await?;
+    Ok(axum::Json(response))
+}
+
+/// GET /api/vaults/:vault_id/vesting/bonus
+pub async fn get_vesting_bonus(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    axum::extract::Path(vault_id): axum::extract::Path<String>,
+) -> Result<axum::Json<crate::models::VestingBonusResponse>, AppError> {
+    let response = get_vesting_bonus_handler(db, &vault_id)?;
+    Ok(axum::Json(response))
+}
+
 // ── Audit log export endpoint (#1493) ────────────────────────────────────────
 
 #[derive(Deserialize)]

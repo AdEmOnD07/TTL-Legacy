@@ -1745,6 +1745,25 @@ fn vesting_bonus_app() -> Router {
 
 #[tokio::test]
 async fn test_claim_vesting_bonus_success() {
+    let mut server = mockito::Server::new_async().await;
+    let tx_hash = "ab".repeat(32);
+    let rpc_mock = server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": { "transaction": "c2lnbmVkLXR4" },
+        })))
+        .with_status(200)
+        .with_body(format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"hash":"{tx_hash}","status":"PENDING"}}}}"#
+        ))
+        .create_async()
+        .await;
+    let previous_rpc_url = std::env::var_os("SOROBAN_RPC_URL");
+    std::env::set_var("SOROBAN_RPC_URL", server.url());
+
     let app = vesting_bonus_app();
     let res = app
         .oneshot(
@@ -1753,7 +1772,7 @@ async fn test_claim_vesting_bonus_success() {
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"beneficiary":"beneficiary1","memo":"test-claim"}"#,
+                    r#"{"beneficiary":"beneficiary1","transaction_xdr":"c2lnbmVkLXR4","memo":"test-claim"}"#,
                 ))
                 .unwrap(),
         )
@@ -1768,7 +1787,14 @@ async fn test_claim_vesting_bonus_success() {
     assert_eq!(json["vault_id"], "vesting-vault-1");
     assert!(json["claimed_amount"].as_i128().unwrap() > 0);
     assert!(json["bonus_amount"].as_i128().unwrap() >= 0);
-    assert!(!json["transaction_hash"].as_str().unwrap().is_empty());
+    assert_eq!(json["tx_hash"].as_str().unwrap(), tx_hash);
+    assert_eq!(json["tx_hash"].as_str().unwrap().len(), 64);
+    rpc_mock.assert_async().await;
+    if let Some(previous_rpc_url) = previous_rpc_url {
+        std::env::set_var("SOROBAN_RPC_URL", previous_rpc_url);
+    } else {
+        std::env::remove_var("SOROBAN_RPC_URL");
+    }
 }
 
 #[tokio::test]
@@ -1781,14 +1807,14 @@ async fn test_claim_vesting_bonus_not_beneficiary() {
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"beneficiary":"wrong-beneficiary","memo":null}"#,
+                    r#"{"beneficiary":"wrong-beneficiary","transaction_xdr":"c2lnbmVkLXR4","memo":null}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -1800,13 +1826,13 @@ async fn test_claim_vesting_bonus_no_bonus_configured() {
                 .uri("/api/vaults/vesting-vault-2/vesting/claim-bonus")
                 .method(Method::POST)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"beneficiary":"beneficiary1","memo":null}"#))
+                .body(Body::from(r#"{"beneficiary":"beneficiary1","transaction_xdr":"c2lnbmVkLXR4","memo":null}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

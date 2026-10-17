@@ -21,7 +21,8 @@ pub use types::{
     PendingBeneficiaryUpdate, PendingMultiSigOp, ProofOfLifeEntry, ProposalStatus,
     ReleaseCondition, ReleaseEvent, ReleaseVoteEntry, StateTransitionEntry,
     TokenCollateral, TokenConversion, TokenHedge, TokenLending, TokenRebalanceConfig, TokenStaking,
-    TokenWeight, TtlBorrowRecord, UpgradeProposal, VaultStatusSummary, VestingBonusConfig,
+    TokenWeight, TtlBorrowRecord, UpgradeProposal, VaultHealthSummary, VaultStatusSummary,
+    VestingBonusConfig,
     VestingCatchUpConfig, VestingPenaltyConfig, VestingPendingClaim, VestingSchedule,
     WhitelistEntry, WithdrawalAuditEntry, WithdrawalDispute, WithdrawalLimit, WithdrawalReversal,
     WithdrawalScheduleEntry, WithdrawalTracker, YieldDistributionConfig, YieldDistributionMode,
@@ -392,6 +393,8 @@ const MAX_PERSISTENT_TTL: u32 = 3_110_400;
 const MAX_SNAPSHOTS_PER_VAULT: u32 = 1_000;
 /// Maximum number of vault IDs accepted by `get_vault_batch_status` in a single call.
 const MAX_BATCH_STATUS_SIZE: u32 = 100;
+/// Maximum number of vault IDs accepted by `get_vault_batch` in a single call.
+const MAX_VAULT_BATCH_SIZE: u32 = 50;
 
 /// Two-step ownership transfer constants - Issue #1119
 /// 24-hour time-lock before new owner can accept the transfer (in seconds)
@@ -4175,9 +4178,9 @@ impl TtlVaultContract {
     /// # Errors
     /// Panics with `ContractError::VaultNotFound` if the vault does not exist.
     pub fn get_beneficiary(env: Env, vault_id: u64) -> Result<Address, ContractError> {
-        Self::try_load_vault(&env, vault_id)
-            .map(|v| v.beneficiary)
-            .ok_or(ContractError::VaultNotFound)
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        Self::extend_live_vault_ttl(&env, vault_id, &vault);
+        Ok(vault.beneficiary)
     }
 
     /// Returns the creation timestamp of a vault.
@@ -9959,6 +9962,17 @@ impl TtlVaultContract {
             .persistent()
             .get::<StorageKey, ArchivedVaultInfo>(&StorageKey::ArchivedVault(vault_id))
             .map(|info| info.0)
+    }
+
+    fn extend_live_vault_ttl(env: &Env, vault_id: u64, vault: &Vault) {
+        let key = StorageKey::Vault(vault_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(
+                &key,
+                VAULT_TTL_THRESHOLD,
+                vault_ttl_ledgers(vault.check_in_interval),
+            );
+        }
     }
 
     fn load_owner_vault_ids(env: &Env, owner: &Address) -> Vec<u64> {
@@ -17335,6 +17349,69 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&StorageKey::Lending(vault_id))
+    }
+
+    /// Returns a compact health snapshot for a vault.
+    ///
+    /// A vault that has not had an explicit check-in reports `last_check_in: None`;
+    /// its TTL is still calculated from the creation timestamp.
+    pub fn get_vault_health_summary(
+        env: Env,
+        vault_id: u64,
+    ) -> Result<VaultHealthSummary, ContractError> {
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        Self::extend_live_vault_ttl(&env, vault_id, &vault);
+
+        let has_checked_in = vault.total_check_ins > 0;
+        let ttl_start = if has_checked_in {
+            vault.last_check_in
+        } else {
+            vault.created_at
+        };
+        let deadline = ttl_start.saturating_add(vault.check_in_interval);
+        let now = env.ledger().timestamp();
+        let ttl_remaining = if now >= deadline {
+            None
+        } else {
+            Some(deadline - now)
+        };
+
+        Ok(VaultHealthSummary {
+            last_check_in: if has_checked_in {
+                Some(vault.last_check_in)
+            } else {
+                None
+            },
+            ttl_remaining,
+            balance: vault.balance,
+            is_paused: vault.is_paused,
+        })
+    }
+
+    /// Returns the full state for each requested vault ID, preserving input order.
+    /// Unknown IDs are represented as `None`.
+    ///
+    /// # Errors
+    /// * `ContractError::BatchTooLarge` - If more than `MAX_VAULT_BATCH_SIZE` IDs are requested
+    pub fn get_vault_batch(
+        env: Env,
+        vault_ids: Vec<u64>,
+    ) -> Result<Vec<Option<Vault>>, ContractError> {
+        if vault_ids.len() > MAX_VAULT_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let mut result = Vec::new(&env);
+        for vault_id in vault_ids.iter() {
+            let vault = Self::try_load_vault(&env, vault_id);
+            if let Some(vault) = vault {
+                Self::extend_live_vault_ttl(&env, vault_id, &vault);
+                result.push_back(Some(vault));
+            } else {
+                result.push_back(None);
+            }
+        }
+        Ok(result)
     }
 
     // --- batch status ---
