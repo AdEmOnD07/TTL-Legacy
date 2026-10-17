@@ -543,6 +543,96 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/vaults/{vault_id}/hibernation:
+    parameters:
+      - name: vault_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: The vault ID
+    get:
+      summary: Get vault hibernation status
+      operationId: getVaultHibernation
+      tags:
+        - Vaults
+      responses:
+        '200':
+          description: Current hibernation entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HibernationEntry'
+        '404':
+          description: Vault or hibernation entry not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Enter vault hibernation
+      operationId: enterVaultHibernation
+      tags:
+        - Vaults
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HibernationRequest'
+      responses:
+        '201':
+          description: Hibernation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HibernationEntry'
+        '400':
+          description: Invalid hibernation duration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the vault owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Exit vault hibernation
+      operationId: exitVaultHibernation
+      tags:
+        - Vaults
+      parameters:
+        - name: caller
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Vault owner address
+      responses:
+        '204':
+          description: Hibernation ended and the entry TTL was restored
+        '403':
+          description: Caller is not the vault owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault or hibernation entry not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/vaults/{vault_id}/share:
     post:
       summary: Share vault access
@@ -802,6 +892,129 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/vaults/{vault_id}/vesting/bonus:
+    get:
+      summary: Get vesting bonus configuration
+      operationId: getVestingBonus
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Vesting bonus configuration for the vault
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [vault_id, configured]
+                properties:
+                  vault_id:
+                    type: string
+                  configured:
+                    type: boolean
+                  bonus_bps:
+                    type: integer
+                    nullable: true
+                  on_time_window_seconds:
+                    type: integer
+                    format: int64
+                    nullable: true
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/vaults/{vault_id}/vesting/claim-bonus:
+    post:
+      summary: Submit a beneficiary-signed vesting bonus claim
+      description: >
+        Relays the signed Soroban transaction to the configured RPC endpoint and
+        returns the transaction hash reported by the network. The backend does
+        not sign transactions on behalf of beneficiaries.
+      operationId: claimVestingBonus
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [beneficiary, transaction_xdr]
+              properties:
+                beneficiary:
+                  type: string
+                  description: Stellar account address of the vault beneficiary
+                transaction_xdr:
+                  type: string
+                  maxLength: 2000000
+                  description: Base64-encoded, beneficiary-signed Soroban transaction XDR
+                memo:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Transaction accepted by Soroban RPC
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [vault_id, claimed_amount, bonus_amount, tx_hash, claimed_at]
+                properties:
+                  vault_id:
+                    type: string
+                  claimed_amount:
+                    type: integer
+                    format: int64
+                  bonus_amount:
+                    type: integer
+                    format: int64
+                  tx_hash:
+                    type: string
+                    pattern: '^[a-fA-F0-9]{64}$'
+                  claimed_at:
+                    type: string
+                    format: date-time
+        '403':
+          description: Caller is not the vault beneficiary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault or vesting bonus configuration not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid transaction request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: Soroban RPC rejected the transaction or could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Soroban RPC URL is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   schemas:
     ErrorResponse:
@@ -1043,6 +1256,42 @@ components:
         - check_in_interval
         - created_at
         - status
+
+    HibernationRequest:
+      type: object
+      properties:
+        caller:
+          type: string
+          description: Vault owner address
+        duration_seconds:
+          type: integer
+          format: int64
+          minimum: 3600
+          maximum: 15552000
+          description: Requested duration, bounded by the per-vault maximum
+      required:
+        - caller
+        - duration_seconds
+
+    HibernationEntry:
+      type: object
+      properties:
+        started_at:
+          type: integer
+          format: int64
+          description: Ledger timestamp when hibernation started
+        duration_seconds:
+          type: integer
+          format: int64
+          description: Configured hibernation duration in seconds
+        remaining_ttl_at_entry:
+          type: integer
+          format: int64
+          description: TTL remaining when hibernation started, restored on exit
+      required:
+        - started_at
+        - duration_seconds
+        - remaining_ttl_at_entry
 
     SearchQuery:
       type: object

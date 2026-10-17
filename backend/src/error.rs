@@ -58,6 +58,12 @@ pub enum AppError {
     TwoFactorNotEnabled,
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("Soroban RPC error: {0}")]
+    Rpc(String),
+    #[error("Soroban RPC is not configured")]
+    RpcUnavailable,
     #[error("email delivery failed: {0}")]
     EmailDelivery(String),
     #[error("internal error: {0}")]
@@ -73,6 +79,9 @@ impl IntoResponse for AppError {
             AppError::TwoFactorRequired => (StatusCode::UNAUTHORIZED, "two_factor_required"),
             AppError::TwoFactorNotEnabled => (StatusCode::BAD_REQUEST, "two_factor_not_enabled"),
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            AppError::Rpc(_) => (StatusCode::BAD_GATEWAY, "rpc_error"),
+            AppError::RpcUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "rpc_unavailable"),
             AppError::EmailDelivery(_) => (StatusCode::BAD_GATEWAY, "email_delivery_failed"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };

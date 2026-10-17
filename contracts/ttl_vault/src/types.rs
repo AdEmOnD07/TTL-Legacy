@@ -520,6 +520,7 @@ pub enum StorageKey {
     WithdrawalHistoryLen(u64),
     // Issue #572: Withdrawal Dispute
     WithdrawalDisputes(u64),
+    WithdrawalDisputeAuditIndices(u64),
     // Issue #565: withdrawal scheduling validation
     WithdrawalScheduleValidation(u64),
     // Issue #566: withdrawal limits by time
@@ -621,6 +622,7 @@ pub enum StorageKey {
     WithdrawalProof(u64, u64),
     WithdrawalRateLimit(u64),
     WithdrawalRollback(u64),
+    MaxHibernationDuration(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -991,6 +993,15 @@ pub struct VaultStatusSummary {
     pub status: ReleaseStatus,
     pub balance: i128,
     pub ttl_remaining: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultHealthSummary {
+    pub last_check_in: Option<u64>,
+    pub ttl_remaining: Option<u64>,
+    pub balance: i128,
+    pub is_paused: bool,
 }
 
 #[contracttype]
@@ -1488,7 +1499,7 @@ pub struct HibernationEntry {
     pub started_at: u64,
     /// How many seconds the hibernation lasts.
     pub duration_seconds: u64,
-    /// TTL remaining when the vault entered hibernation.
+    /// TTL remaining when hibernation started, restored when it ends.
     pub remaining_ttl_at_entry: u64,
 }
 

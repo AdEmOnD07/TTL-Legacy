@@ -213,3 +213,43 @@ proptest! {
         prop_assert_eq!(bps_sum(&stored), 10_000);
     }
 }
+
+proptest! {
+    #[test]
+    fn prop_bps_split_preserves_balance_and_assigns_remainder_to_first(
+        balance in 1i128..(i128::MAX / 100 + 1),
+        weights in prop::collection::vec(1u32..10_001u32, 1..21),
+    ) {
+        let env = Env::default();
+        let total_weight: u64 = weights.iter().map(|weight| *weight as u64).sum();
+        let mut bps = soroban_sdk::Vec::new(&env);
+        let mut allocated_bps = 0u32;
+
+        for (index, weight) in weights.iter().enumerate() {
+            let allocation = if index + 1 == weights.len() {
+                10_000 - allocated_bps
+            } else {
+                ((*weight as u64 * 10_000) / total_weight) as u32
+            };
+            allocated_bps += allocation;
+            bps.push_back(allocation);
+        }
+
+        let shares = TtlVaultContract::calculate_weighted_shares(
+            &env,
+            balance,
+            &bps,
+            10_000,
+        );
+        let distributed: i128 = shares.iter().sum();
+        let non_first_shares: i128 = (1..bps.len())
+            .map(|index| {
+                TtlVaultContract::weighted_share(balance, bps.get(index).unwrap(), 10_000)
+            })
+            .sum();
+
+        prop_assert!(distributed <= balance);
+        prop_assert_eq!(distributed, balance);
+        prop_assert_eq!(shares.get(0).unwrap(), balance - non_first_shares);
+    }
+}

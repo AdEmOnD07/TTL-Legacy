@@ -3300,6 +3300,33 @@ fn test_get_vault_does_not_extend_ttl_when_above_threshold() {
     );
 }
 
+#[test]
+fn test_get_beneficiary_extends_ttl_when_below_threshold() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let contract_id = client.address.clone();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let advance = (VAULT_TTL_LEDGERS - VAULT_TTL_THRESHOLD + 1) as u32;
+    env.ledger().set_sequence_number(env.ledger().sequence() + advance);
+
+    let ttl_before = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&StorageKey::Vault(vault_id))
+    });
+    assert!(ttl_before < VAULT_TTL_THRESHOLD);
+
+    assert_eq!(client.get_beneficiary(&vault_id), beneficiary);
+
+    let ttl_after = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&StorageKey::Vault(vault_id))
+    });
+    assert!(ttl_after >= VAULT_TTL_LEDGERS);
+}
+
 
 // ---- Issue #369: Security Audit Tests ----
 
@@ -6185,6 +6212,42 @@ fn test_get_beneficiary_is_distinct_from_owner() {
     let returned_beneficiary = client.get_beneficiary(&vault_id).unwrap();
     let returned_owner = client.get_vault_owner(&vault_id);
     assert_ne!(returned_beneficiary, returned_owner);
+}
+
+#[test]
+fn test_get_vault_health_summary_before_first_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+    let vault_id = client.create_vault(&owner, &beneficiary, &MIN_CHECK_IN_INTERVAL, &None);
+
+    let summary = client.get_vault_health_summary(&vault_id).unwrap();
+
+    assert!(summary.last_check_in.is_none());
+    assert_eq!(summary.ttl_remaining, Some(MIN_CHECK_IN_INTERVAL));
+}
+
+#[test]
+fn test_get_vault_batch_preserves_order_and_missing_ids() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &MIN_CHECK_IN_INTERVAL, &None);
+    let ids = vec![&env, vault_id, 9999u64];
+
+    let batch = client.get_vault_batch(&ids).unwrap();
+
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch.get(0).unwrap().unwrap().beneficiary, beneficiary);
+    assert!(batch.get(1).unwrap().is_none());
+}
+
+#[test]
+fn test_get_vault_batch_rejects_more_than_maximum_size() {
+    let (env, _, _, _, _, client) = setup();
+    let mut ids = Vec::new(&env);
+    for vault_id in 0..=MAX_VAULT_BATCH_SIZE {
+        ids.push_back(vault_id as u64);
+    }
+
+    assert!(client.try_get_vault_batch(&ids).is_err());
 }
 
 // ---- get_vault_status tests ----
