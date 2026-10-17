@@ -614,6 +614,7 @@ pub enum ContractError {
     // Issue #1528: withdrawal whitelist expiry
     WhitelistEntryExpired = 150,
     InvalidWhitelistExpiry = 151,
+    CheckInTooEarly = 152,
 }
 
 #[contract]
@@ -2062,8 +2063,8 @@ impl TtlVaultContract {
                 .persistent()
                 .get::<StorageKey, u64>(&StorageKey::LastCheckInTime(vault_id))
             {
-                if now < last + cooldown {
-                    return Err(ContractError::InvalidInterval);
+                if now < last.saturating_add(cooldown) {
+                    return Err(ContractError::CheckInTooEarly);
                 }
             }
         }
@@ -2566,104 +2567,32 @@ impl TtlVaultContract {
             );
             return Err(ContractError::InvalidWithdrawDestination);
         }
-        if vault.balance < amount {
-            Self::record_withdrawal_audit(
-                &env,
-                vault_id,
-                &caller,
-                amount,
-                false,
-                "Insufficient balance",
-            );
-            return Err(ContractError::InsufficientBalance);
-        }
-
-        // Check minimum balance guard - Issue #1088
-        if let Some(min_guard) = vault.min_balance_guard {
-            if vault.balance - amount < min_guard {
-                Self::record_withdrawal_audit(
-                    &env,
-                    vault_id,
-                    &caller,
-                    amount,
-                    false,
-                    "Below minimum balance",
-                );
-                return Err(ContractError::BelowMinimumBalance);
+        let destination = vault.owner.clone();
+        vault = match Self::validate_withdrawal(&env, vault_id, &vault, amount, &destination) {
+            Ok(vault) => vault,
+            Err(error) => {
+                let reason = match error {
+                    ContractError::InsufficientBalance => "Insufficient balance",
+                    ContractError::BelowMinimumBalance => "Below minimum balance",
+                    ContractError::WithdrawalNotApproved => "Withdrawal not approved",
+                    ContractError::WithdrawalRateLimitExceeded => "Withdrawal rate limit exceeded",
+                    ContractError::WithdrawalDestinationNotWhitelisted => "Destination not whitelisted",
+                    _ => "Withdrawal validation failed",
+                };
+                Self::record_withdrawal_audit(&env, vault_id, &caller, amount, false, reason);
+                if error == ContractError::WithdrawalDestinationNotWhitelisted {
+                    env.events().publish(
+                        (WHITELIST_VIOLATION_TOPIC, vault_id),
+                        (&destination, amount),
+                    );
+                }
+                return Err(error);
             }
-        }
-
-        // Check withdrawal approval threshold - Issue #404
-        if let Some(threshold) = vault.withdrawal_approval_threshold {
-            if amount > threshold {
-                Self::record_withdrawal_audit(
-                    &env,
-                    vault_id,
-                    &caller,
-                    amount,
-                    false,
-                    "Withdrawal not approved",
-                );
-                return Err(ContractError::WithdrawalNotApproved);
-            }
-        }
-
-        // Check withdrawal limits - Issue #566
-        Self::check_withdrawal_limits(&env, vault_id, amount)?;
-
-        // Check withdrawal rate limiting - Issue #1084
-        if let Some(limit) = vault.withdrawal_limit_per_window {
-            let now = env.ledger().timestamp();
-            let window_elapsed = now - vault.window_start;
-
-            let mut vault_mut = vault.clone();
-            if window_elapsed >= vault_mut.withdrawal_window_seconds {
-                vault_mut.withdrawn_in_window = 0;
-                vault_mut.window_start = now;
-            }
-
-            if vault_mut.withdrawn_in_window + amount > limit {
-                Self::record_withdrawal_audit(
-                    &env,
-                    vault_id,
-                    &caller,
-                    amount,
-                    false,
-                    "Withdrawal rate limit exceeded",
-                );
-                return Err(ContractError::WithdrawalRateLimitExceeded);
-            }
-
-            vault = vault_mut;
-        }
-
-        // Check whitelist - Issue #567 / #952
-        // withdraw() always transfers to vault.owner, so we validate the owner
-        // is an approved destination when a whitelist is configured.
-        if let Err(e) = Self::check_whitelisted(&env, vault_id, &vault.owner) {
-            Self::record_withdrawal_audit(
-                &env,
-                vault_id,
-                &caller,
-                amount,
-                false,
-                "Destination not whitelisted",
-            );
-            env.events().publish(
-                (WHITELIST_VIOLATION_TOPIC, vault_id),
-                (&vault.owner, amount),
-            );
-            return Err(e);
-        }
+        };
 
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
         vault.balance -= amount;
-
-        // Update withdrawal rate tracking - Issue #1084
-        if vault.withdrawal_limit_per_window.is_some() {
-            vault.withdrawn_in_window += amount;
-        }
 
         // Record withdrawal for reversal - Issue #568 (grace period: 24 hours)
         Self::record_withdrawal_for_reversal(&env, vault_id, amount, 86_400);
@@ -2739,6 +2668,7 @@ impl TtlVaultContract {
         // First pass: validate every instruction individually and accumulate the
         // total requested amount per vault so we can validate against the balance.
         let mut vault_totals: Map<u64, i128> = Map::new(&env);
+        let mut validated_vaults: Map<u64, Vault> = Map::new(&env);
         for w in withdrawals.iter() {
             if w.amount <= 0 {
                 Self::record_withdrawal_audit(
@@ -2751,8 +2681,10 @@ impl TtlVaultContract {
                 );
                 return Err(ContractError::InvalidAmount);
             }
-            let vault =
-                Self::try_load_vault(&env, w.vault_id).ok_or(ContractError::VaultNotFound)?;
+            let mut vault = validated_vaults
+                .get(w.vault_id)
+                .or_else(|| Self::try_load_vault(&env, w.vault_id))
+                .ok_or(ContractError::VaultNotFound)?;
             if caller != vault.owner {
                 Self::record_withdrawal_audit(
                     &env,
@@ -2847,17 +2779,38 @@ impl TtlVaultContract {
                 );
                 return Err(ContractError::AlreadyReleased);
             }
-            if let Err(e) = Self::check_whitelisted(&env, w.vault_id, &w.destination) {
-                Self::record_withdrawal_audit(
-                    &env,
-                    w.vault_id,
-                    &caller,
-                    w.amount,
-                    false,
-                    "Destination not whitelisted",
-                );
-                return Err(e);
-            }
+            vault = match Self::validate_withdrawal(
+                &env,
+                w.vault_id,
+                &vault,
+                w.amount,
+                &w.destination,
+            ) {
+                Ok(vault) => vault,
+                Err(error) => {
+                    let reason = if error == ContractError::WithdrawalDestinationNotWhitelisted {
+                        "Destination not whitelisted"
+                    } else {
+                        "Withdrawal validation failed"
+                    };
+                    Self::record_withdrawal_audit(
+                        &env,
+                        w.vault_id,
+                        &caller,
+                        w.amount,
+                        false,
+                        reason,
+                    );
+                    if error == ContractError::WithdrawalDestinationNotWhitelisted {
+                        env.events().publish(
+                            (WHITELIST_VIOLATION_TOPIC, w.vault_id),
+                            (&w.destination, w.amount),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            validated_vaults.set(w.vault_id, vault);
             let current = vault_totals.get(w.vault_id).unwrap_or(0i128);
             vault_totals.set(w.vault_id, current + w.amount);
         }
@@ -2866,7 +2819,9 @@ impl TtlVaultContract {
         let mut vault_keys = vault_totals.keys().iter();
         while let Some(vault_id) = vault_keys.next() {
             let total = vault_totals.get(vault_id).unwrap_or(0i128);
-            let vault = Self::load_vault(&env, vault_id);
+            let vault = validated_vaults
+                .get(vault_id)
+                .unwrap_or_else(|| Self::load_vault(&env, vault_id));
             if vault.balance < total {
                 Self::record_withdrawal_audit(
                     &env,
@@ -2877,6 +2832,18 @@ impl TtlVaultContract {
                     "Batch total exceeds vault balance",
                 );
                 return Err(ContractError::InsufficientBalance);
+            }
+            if let Some(min_guard) = vault.min_balance_guard {
+                if vault.balance - total < min_guard {
+                    return Err(ContractError::BelowMinimumBalance);
+                }
+            }
+        }
+
+        let mut validated_keys = validated_vaults.keys().iter();
+        while let Some(vault_id) = validated_keys.next() {
+            if let Some(vault) = validated_vaults.get(vault_id) {
+                Self::save_vault(&env, vault_id, &vault);
             }
         }
 
@@ -4226,19 +4193,17 @@ impl TtlVaultContract {
                 (vault.beneficiary.clone(), amount),
             );
         } else {
-            // Multi-beneficiary path: split `amount` by BPS, last entry absorbs dust.
-            let mut distributed: i128 = 0;
-            let last_idx = vault.beneficiaries.len() - 1;
+            let shares = Self::calculate_beneficiary_shares(
+                &env,
+                amount,
+                &vault.beneficiaries,
+                BASIS_POINTS_100_PERCENT as u32,
+            );
             for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                let share = if i as u32 == last_idx {
-                    amount - distributed
-                } else {
-                    amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
-                };
+                let share = shares.get(i as u32).unwrap();
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
-                distributed += share;
                 env.events().publish(
                     (symbol_short!("partial"), vault_id),
                     (entry.address.clone(), share),
@@ -4252,6 +4217,52 @@ impl TtlVaultContract {
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(())
+    }
+
+    fn weighted_share(amount: i128, weight: u32, total_weight: u32) -> i128 {
+        let divisor = total_weight as i128;
+        let weight = weight as i128;
+        (amount / divisor) * weight + ((amount % divisor) * weight) / divisor
+    }
+
+    fn calculate_beneficiary_shares(
+        env: &Env,
+        amount: i128,
+        beneficiaries: &Vec<BeneficiaryEntry>,
+        total_weight: u32,
+    ) -> Vec<i128> {
+        let mut weights = Vec::new(env);
+        for entry in beneficiaries.iter() {
+            weights.push_back(entry.bps);
+        }
+        Self::calculate_weighted_shares(env, amount, &weights, total_weight)
+    }
+
+    fn calculate_weighted_shares(
+        env: &Env,
+        amount: i128,
+        weights: &Vec<u32>,
+        total_weight: u32,
+    ) -> Vec<i128> {
+        let mut shares = Vec::new(env);
+        if weights.is_empty() || total_weight == 0 {
+            return shares;
+        }
+
+        let mut first_share = amount;
+        for i in 1..weights.len() {
+            first_share -= Self::weighted_share(amount, weights.get(i).unwrap(), total_weight);
+        }
+        shares.push_back(first_share);
+
+        for i in 1..weights.len() {
+            shares.push_back(Self::weighted_share(
+                amount,
+                weights.get(i).unwrap(),
+                total_weight,
+            ));
+        }
+        shares
     }
 
     // --- Task 3: set_beneficiaries ---
@@ -5589,18 +5600,17 @@ impl TtlVaultContract {
                 (vault.beneficiary.clone(), amount, unlocked),
             );
         } else {
-            let mut distributed: i128 = 0;
-            let last_idx = vault.beneficiaries.len() - 1;
+            let shares = Self::calculate_beneficiary_shares(
+                &env,
+                amount,
+                &vault.beneficiaries,
+                BASIS_POINTS_100_PERCENT as u32,
+            );
             for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                let share = if i as u32 == last_idx {
-                    amount - distributed
-                } else {
-                    amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
-                };
+                let share = shares.get(i as u32).unwrap();
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
-                distributed += share;
                 env.events().publish(
                     (CLAIM_VEST_TOPIC, vault_id),
                     (entry.address.clone(), share, unlocked),
@@ -6550,18 +6560,17 @@ impl TtlVaultContract {
                 ),
             );
         } else {
-            let mut distributed: i128 = 0;
-            let last_idx = vault.beneficiaries.len() - 1;
+            let shares = Self::calculate_beneficiary_shares(
+                &env,
+                total_claimable,
+                &vault.beneficiaries,
+                BASIS_POINTS_100_PERCENT as u32,
+            );
             for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                let share = if i as u32 == last_idx {
-                    total_claimable - distributed
-                } else {
-                    total_claimable * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
-                };
+                let share = shares.get(i as u32).unwrap();
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
-                distributed += share;
                 env.events().publish(
                     (MILESTONE_CLAIM_TOPIC, vault_id),
                     (
@@ -12218,14 +12227,17 @@ impl TtlVaultContract {
         for i in 0..schedule.len() {
             let entry = schedule.get(i).unwrap();
             if entry.timestamp <= now && entry.amount > 0 {
-                if vault.balance < entry.amount {
-                    return Err(ContractError::InsufficientBalance);
-                }
-
-                let token_client = token::Client::new(&env, &vault.token_address);
                 let beneficiary = Self::get_delegated_beneficiary(&env, vault_id)
                     .unwrap_or(vault.beneficiary.clone());
+                vault = Self::validate_withdrawal(
+                    &env,
+                    vault_id,
+                    &vault,
+                    entry.amount,
+                    &beneficiary,
+                )?;
 
+                let token_client = token::Client::new(&env, &vault.token_address);
                 token_client.transfer(&env.current_contract_address(), &beneficiary, &entry.amount);
 
                 vault.balance -= entry.amount;
@@ -15103,8 +15115,8 @@ impl TtlVaultContract {
                 .persistent()
                 .get::<StorageKey, u64>(&StorageKey::LastCheckInTime(vault_id))
             {
-                if now < last + cooldown {
-                    return Err(ContractError::InvalidInterval);
+                if now < last.saturating_add(cooldown) {
+                    return Err(ContractError::CheckInTooEarly);
                 }
             }
         }
@@ -15228,6 +15240,52 @@ impl TtlVaultContract {
         env.events()
             .publish((WITHDRAW_TOPIC, vault_id), (amount, v.balance));
         Ok(())
+    }
+
+    fn validate_withdrawal(
+        env: &Env,
+        vault_id: u64,
+        vault: &Vault,
+        amount: i128,
+        destination: &Address,
+    ) -> Result<Vault, ContractError> {
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        if vault.balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+        if let Some(min_guard) = vault.min_balance_guard {
+            if vault.balance - amount < min_guard {
+                return Err(ContractError::BelowMinimumBalance);
+            }
+        }
+        if let Some(threshold) = vault.withdrawal_approval_threshold {
+            if amount > threshold {
+                return Err(ContractError::WithdrawalNotApproved);
+            }
+        }
+
+        Self::check_withdrawal_limits(env, vault_id, amount)?;
+
+        let mut updated_vault = vault.clone();
+        if let Some(limit) = updated_vault.withdrawal_limit_per_window {
+            let now = env.ledger().timestamp();
+            if now.saturating_sub(updated_vault.window_start)
+                >= updated_vault.withdrawal_window_seconds
+            {
+                updated_vault.withdrawn_in_window = 0;
+                updated_vault.window_start = now;
+            }
+            updated_vault.withdrawn_in_window = updated_vault
+                .withdrawn_in_window
+                .checked_add(amount)
+                .filter(|total| *total <= limit)
+                .ok_or(ContractError::WithdrawalRateLimitExceeded)?;
+        }
+
+        Self::check_whitelisted(env, vault_id, destination)?;
+        Ok(updated_vault)
     }
 
     // ── Issue #482: check-in history helpers ─────────────────────────────────
@@ -15849,7 +15907,11 @@ impl TtlVaultContract {
                 continue;
             }
 
-            let initial_share = release_amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT;
+            let initial_share = Self::weighted_share(
+                release_amount,
+                entry.bps,
+                BASIS_POINTS_100_PERCENT as u32,
+            );
             if entry.minimum_threshold > 0 && initial_share < entry.minimum_threshold {
                 env.events().publish(
                     (MIN_THRESHOLD_SKIP_TOPIC,),
@@ -15895,14 +15957,14 @@ impl TtlVaultContract {
             );
         }
 
-        let mut distributed: i128 = 0;
-        let last_idx = qualifying.len() - 1;
+        let shares = Self::calculate_beneficiary_shares(
+            env,
+            release_amount,
+            &qualifying,
+            total_qualifying_bps,
+        );
         for (i, entry) in qualifying.iter().enumerate() {
-            let share = if i as u32 == last_idx {
-                release_amount - distributed
-            } else {
-                release_amount * (entry.bps as i128) / (total_qualifying_bps as i128)
-            };
+            let share = shares.get(i as u32).unwrap();
             if share > 0 {
                 token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 env.events().publish(
@@ -15915,7 +15977,6 @@ impl TtlVaultContract {
                     },
                 );
             }
-            distributed += share;
             env.events().publish(
                 (MIN_THRESHOLD_REDISTRIBUTE_TOPIC,),
                 (vault_id, entry.address.clone(), share),
@@ -16643,18 +16704,17 @@ impl TtlVaultContract {
                 (vault.beneficiary.clone(), amount, claimable),
             );
         } else {
-            let mut distributed: i128 = 0;
-            let last_idx = vault.beneficiaries.len() - 1;
+            let shares = Self::calculate_beneficiary_shares(
+                &env,
+                amount,
+                &vault.beneficiaries,
+                BASIS_POINTS_100_PERCENT as u32,
+            );
             for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                let share = if i as u32 == last_idx {
-                    amount - distributed
-                } else {
-                    amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
-                };
+                let share = shares.get(i as u32).unwrap();
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
-                distributed += share;
                 env.events().publish(
                     (VESTING_CATCHUP_CLAIMED_TOPIC, vault_id),
                     (entry.address.clone(), share, claimable),
@@ -16841,14 +16901,14 @@ impl TtlVaultContract {
                     (vault.beneficiary.clone(), fallback, 0i128),
                 );
             } else {
-                let mut distributed: i128 = 0;
-                let last_idx = vault.beneficiaries.len() - 1;
+                let shares = Self::calculate_beneficiary_shares(
+                    &env,
+                    fallback,
+                    &vault.beneficiaries,
+                    BASIS_POINTS_100_PERCENT as u32,
+                );
                 for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                    let share = if i as u32 == last_idx {
-                        fallback - distributed
-                    } else {
-                        fallback * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
-                    };
+                    let share = shares.get(i as u32).unwrap();
                     if share > 0 {
                         token_client.transfer(
                             &env.current_contract_address(),
@@ -16856,7 +16916,6 @@ impl TtlVaultContract {
                             &share,
                         );
                     }
-                    distributed += share;
                     env.events().publish(
                         (VESTING_BONUS_CLAIMED_TOPIC, vault_id),
                         (entry.address.clone(), share, 0i128),
@@ -16891,18 +16950,17 @@ impl TtlVaultContract {
                 (vault.beneficiary.clone(), total_amount, bonus),
             );
         } else {
-            let mut distributed: i128 = 0;
-            let last_idx = vault.beneficiaries.len() - 1;
+            let shares = Self::calculate_beneficiary_shares(
+                &env,
+                total_amount,
+                &vault.beneficiaries,
+                BASIS_POINTS_100_PERCENT as u32,
+            );
             for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                let share = if i as u32 == last_idx {
-                    total_amount - distributed
-                } else {
-                    total_amount * (entry.bps as i128) / BASIS_POINTS_100_PERCENT
-                };
+                let share = shares.get(i as u32).unwrap();
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
                 }
-                distributed += share;
                 let entry_bonus = if all_on_time {
                     share * bonus_cfg.bonus_bps as i128 / (10_000 + bonus_cfg.bonus_bps as i128)
                 } else {
@@ -18104,9 +18162,24 @@ impl TtlVaultContract {
             .get(&dispute_key)
             .unwrap_or_else(|| Vec::new(&env));
 
+        let audit_indices_key = StorageKey::WithdrawalDisputeAuditIndices(vault_id);
+        let mut audit_indices: Vec<Option<u32>> = env
+            .storage()
+            .persistent()
+            .get(&audit_indices_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        while audit_indices.len() < disputes.len() {
+            audit_indices.push_back(None);
+        }
+
         for i in 0..disputes.len() {
             let d = disputes.get(i).unwrap();
-            if d.withdrawal_timestamp == entry.timestamp && d.status == DisputeStatus::Filed {
+            let linked_audit_index = audit_indices.get(i).flatten();
+            if d.status == DisputeStatus::Filed
+                && (linked_audit_index == Some(audit_log_index)
+                    || (linked_audit_index.is_none()
+                        && d.withdrawal_timestamp == entry.timestamp))
+            {
                 return Err(ContractError::DisputeFiled);
             }
         }
@@ -18126,12 +18199,19 @@ impl TtlVaultContract {
         };
 
         disputes.push_back(dispute);
+        audit_indices.push_back(Some(audit_log_index));
 
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage().persistent().set(&dispute_key, &disputes);
         env.storage()
             .persistent()
+            .set(&audit_indices_key, &audit_indices);
+        env.storage()
+            .persistent()
             .extend_ttl(&dispute_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage()
+            .persistent()
+            .extend_ttl(&audit_indices_key, VAULT_TTL_THRESHOLD, ttl);
 
         env.storage()
             .instance()
