@@ -147,8 +147,10 @@ pub use types::{
     MIN_THRESHOLD_SET_TOPIC,
     MIN_THRESHOLD_SKIP_TOPIC,
     MULTISIG_APPROVED_TOPIC,
+    MULTISIG_CANCELLED_TOPIC,
     MULTISIG_CONFIG_TOPIC,
     MULTISIG_EXECUTED_TOPIC,
+    MULTISIG_EXPIRED_TOPIC,
     MULTISIG_PROPOSAL_EXPIRY,
     MULTISIG_PROPOSED_TOPIC,
     MULTISIG_REJECTED_TOPIC,
@@ -7089,10 +7091,25 @@ impl TtlVaultContract {
     /// `None` if the vault does not exist or the TTL has already lapsed.
     pub fn get_ttl_remaining(env: Env, vault_id: u64) -> Option<u64> {
         let vault = Self::try_load_vault(&env, vault_id)?;
-        let deadline = vault.last_check_in.saturating_add(vault.check_in_interval);
-        // Read the live ledger timestamp on every call so the result reflects the
-        // current ledger rather than the state at the last check-in.
         let now = env.ledger().timestamp();
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, HibernationEntry>(&StorageKey::Hibernation(vault_id))
+        {
+            let elapsed = now.saturating_sub(entry.started_at);
+            let elapsed_after_hibernation = elapsed.saturating_sub(entry.duration_seconds);
+            let remaining = entry
+                .remaining_ttl_at_entry
+                .saturating_sub(elapsed_after_hibernation);
+            return if remaining == 0 {
+                None
+            } else {
+                Some(remaining)
+            };
+        }
+
+        let deadline = vault.last_check_in.saturating_add(vault.check_in_interval);
         if now >= deadline {
             None
         } else {
@@ -13378,6 +13395,8 @@ impl TtlVaultContract {
             return Err(ContractError::NotASigner);
         }
 
+        let _ = Self::get_pending_multisig_ops(env.clone(), vault_id);
+
         let prop_key = StorageKey::MultiSigProposal(vault_id, proposal_id);
         let mut proposal = env
             .storage()
@@ -13385,14 +13404,16 @@ impl TtlVaultContract {
             .get::<StorageKey, MultiSigProposal>(&prop_key)
             .ok_or(ContractError::ProposalNotFound)?;
 
-        if proposal.status != ProposalStatus::Pending {
-            return Err(ContractError::ProposalNotFound);
-        }
         let now = env.ledger().timestamp();
         if now > proposal.expires_at {
-            proposal.status = ProposalStatus::Expired;
-            env.storage().persistent().set(&prop_key, &proposal);
-            return Err(ContractError::ProposalExpired);
+            env.storage().persistent().remove(&prop_key);
+            Self::remove_open_proposal(&env, vault_id, proposal_id);
+            env.events()
+                .publish((MULTISIG_EXPIRED_TOPIC, vault_id), proposal_id);
+            return Ok(());
+        }
+        if proposal.status != ProposalStatus::Pending {
+            return Err(ContractError::ProposalNotFound);
         }
         // Prevent double-approval
         if proposal.approvals.iter().any(|a| a == caller) {
@@ -13420,6 +13441,48 @@ impl TtlVaultContract {
         Ok(())
     }
 
+    /// Cancel a pending proposal created by the vault owner.
+    pub fn cancel_multisig_proposal(
+        env: Env,
+        vault_id: u64,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let prop_key = StorageKey::MultiSigProposal(vault_id, proposal_id);
+        let mut proposal = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, MultiSigProposal>(&prop_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+        if proposal.status != ProposalStatus::Pending {
+            return Err(ContractError::ProposalNotFound);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            env.storage().persistent().remove(&prop_key);
+            Self::remove_open_proposal(&env, vault_id, proposal_id);
+            env.events()
+                .publish((MULTISIG_EXPIRED_TOPIC, vault_id), proposal_id);
+            return Ok(());
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+        env.storage().persistent().set(&prop_key, &proposal);
+        Self::remove_open_proposal(&env, vault_id, proposal_id);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((MULTISIG_CANCELLED_TOPIC, vault_id), proposal_id);
+        Ok(())
+    }
+
     /// Reject a pending multi-sig proposal (owner-only).
     pub fn reject_multisig(
         env: Env,
@@ -13444,21 +13507,7 @@ impl TtlVaultContract {
         proposal.status = ProposalStatus::Rejected;
         env.storage().persistent().set(&prop_key, &proposal);
 
-        // Remove from open proposals list
-        let open_key = StorageKey::OpenProposals(vault_id);
-        if let Some(mut open_proposals) = env
-            .storage()
-            .persistent()
-            .get::<StorageKey, Vec<u64>>(&open_key)
-        {
-            let mut new_list = Vec::new(&env);
-            for id in open_proposals.iter() {
-                if id != proposal_id {
-                    new_list.push_back(id);
-                }
-            }
-            env.storage().persistent().set(&open_key, &new_list);
-        }
+        Self::remove_open_proposal(&env, vault_id, proposal_id);
 
         env.storage()
             .instance()
@@ -13551,9 +13600,11 @@ impl TtlVaultContract {
         }
         let now = env.ledger().timestamp();
         if now > proposal.expires_at {
-            proposal.status = ProposalStatus::Expired;
-            env.storage().persistent().set(&prop_key, &proposal);
-            return Err(ContractError::ProposalExpired);
+            env.storage().persistent().remove(&prop_key);
+            Self::remove_open_proposal(&env, vault_id, proposal_id);
+            env.events()
+                .publish((MULTISIG_EXPIRED_TOPIC, vault_id), proposal_id);
+            return Ok(());
         }
 
         // Mark executed before performing the operation (re-entrancy guard)
@@ -13722,12 +13773,59 @@ impl TtlVaultContract {
             .unwrap_or(0)
     }
 
+    fn remove_open_proposal(env: &Env, vault_id: u64, proposal_id: u64) {
+        let open_key = StorageKey::OpenProposals(vault_id);
+        if let Some(open_proposals) = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, Vec<u64>>(&open_key)
+        {
+            let mut remaining = Vec::new(env);
+            for id in open_proposals.iter() {
+                if id != proposal_id {
+                    remaining.push_back(id);
+                }
+            }
+            env.storage().persistent().set(&open_key, &remaining);
+        }
+    }
+
     /// Returns a list of open proposal IDs for a vault.
     pub fn list_open_proposals(env: Env, vault_id: u64) -> Vec<u64> {
-        env.storage()
+        let now = env.ledger().timestamp();
+        let stored = env.storage()
             .persistent()
             .get::<StorageKey, Vec<u64>>(&StorageKey::OpenProposals(vault_id))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut open = Vec::new(&env);
+        for proposal_id in stored.iter() {
+            let prop_key = StorageKey::MultiSigProposal(vault_id, proposal_id);
+            match env
+                .storage()
+                .persistent()
+                .get::<StorageKey, MultiSigProposal>(&prop_key)
+            {
+                Some(proposal)
+                    if now > proposal.expires_at
+                        && (proposal.status == ProposalStatus::Pending
+                            || proposal.status == ProposalStatus::Approved) =>
+                {
+                    env.storage().persistent().remove(&prop_key);
+                }
+                Some(proposal)
+                    if proposal.status == ProposalStatus::Pending
+                        || proposal.status == ProposalStatus::Approved =>
+                {
+                    open.push_back(proposal_id)
+                }
+                Some(_) => {}
+                None => {}
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&StorageKey::OpenProposals(vault_id), &open);
+        open
     }
 
     // ── Issue #1117: Pending Multi-Signature Operations ─────────────────────
@@ -13876,7 +13974,9 @@ impl TtlVaultContract {
         let now = env.ledger().timestamp();
         if now > pending_op.expires_at {
             env.storage().persistent().remove(&op_key);
-            return Err(ContractError::ProposalExpired);
+            env.events()
+                .publish((PENDING_MULTISIG_OP_EXPIRED_TOPIC, vault_id), op_nonce);
+            return Ok(());
         }
 
         // Verify payload matches
@@ -13945,7 +14045,9 @@ impl TtlVaultContract {
         let now = env.ledger().timestamp();
         if now > pending_op.expires_at {
             env.storage().persistent().remove(&op_key);
-            return Err(ContractError::ProposalExpired);
+            env.events()
+                .publish((PENDING_MULTISIG_OP_EXPIRED_TOPIC, vault_id), op_nonce);
+            return Ok(());
         }
 
         // Check threshold
@@ -13993,7 +14095,29 @@ impl TtlVaultContract {
         op_nonce: u64,
     ) -> Option<PendingMultiSigOp> {
         let op_key = StorageKey::PendingMultiSigOp(vault_id, op_nonce);
-        env.storage().persistent().get(&op_key)
+        let pending_op = env.storage().persistent().get::<StorageKey, PendingMultiSigOp>(&op_key)?;
+        if env.ledger().timestamp() > pending_op.expires_at {
+            env.storage().persistent().remove(&op_key);
+            None
+        } else {
+            Some(pending_op)
+        }
+    }
+
+    /// Returns all unexpired pending multi-sig operations for a vault and prunes expired entries.
+    pub fn get_pending_multisig_ops(env: Env, vault_id: u64) -> Vec<PendingMultiSigOp> {
+        let last_nonce = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, u64>(&StorageKey::PendingMultiSigOpNonce(vault_id))
+            .unwrap_or(0);
+        let mut pending_ops = Vec::new(&env);
+        for nonce in 1..=last_nonce {
+            if let Some(pending_op) = Self::get_pending_multisig_op(env.clone(), vault_id, nonce) {
+                pending_ops.push_back(pending_op);
+            }
+        }
+        pending_ops
     }
 
     // ── Pending Multi-Sig Operation Execution Helpers ────────────────────────

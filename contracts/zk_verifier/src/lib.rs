@@ -45,6 +45,7 @@ pub enum DataKey {
     Admin,
     Oracle(Address),
     Attestation(BytesN<32>, BytesN<32>),
+    ReleaseReady,
 }
 
 #[contract]
@@ -84,6 +85,7 @@ impl ZkVerifierContract {
     pub fn revoke_oracle(env: Env, oracle: Address) {
         Self::require_admin(&env);
         env.storage().instance().remove(&DataKey::Oracle(oracle));
+        env.storage().instance().set(&DataKey::ReleaseReady, &false);
     }
 
     /// Returns whether the given address is a registered oracle.
@@ -119,12 +121,12 @@ impl ZkVerifierContract {
         env.storage()
             .instance()
             .set(&DataKey::Attestation(proof_hash, claim_hash), &oracle);
+        env.storage().instance().set(&DataKey::ReleaseReady, &false);
     }
 
     /// Verifies a zero-knowledge proof against a claim using oracle attestation.
     ///
-    /// Returns `true` when both `proof` and `claim` are non-empty and `proof`
-    /// is not the known-invalid 0x00 sentinel.
+    /// Returns `true` only when a registered oracle attested this proof and claim.
     ///
     /// Emits a `vfy_claim` event with `(result, claim_hash)` on every call
     /// that passes input validation.
@@ -148,15 +150,27 @@ impl ZkVerifierContract {
             panic_with_error!(&env, VerifierError::InvalidInputLength);
         }
 
-        // STUB: a single 0x00 byte is treated as a known-invalid proof sentinel.
-        // Real ZK verification would replace this with cryptographic validation.
-        let result = !(proof.len() == 1 && proof.get(0) == Some(0x00));
-
+        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
         let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
+        let is_attested = env
+            .storage()
+            .instance()
+            .has(&DataKey::Attestation(proof_hash.clone(), claim_hash.clone()));
+        let result = is_attested;
+        env.storage().instance().set(&DataKey::ReleaseReady, &result);
+
         env.events()
             .publish((VERIFY_CLAIM_TOPIC,), (result, claim_hash));
 
         result
+    }
+
+    /// Implements the vault oracle interface for proof-triggered releases.
+    pub fn query_release(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReleaseReady)
+            .unwrap_or(false)
     }
 }
 

@@ -61,6 +61,21 @@ fn test_attested_proof_returns_true() {
 }
 
 #[test]
+fn test_query_release_tracks_proof_verification_result() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = Bytes::from_slice(&env, &[1u8; EXPECTED_PROOF_SIZE as usize]);
+    let claim = Bytes::from_slice(&env, &[2u8; EXPECTED_CLAIM_SIZE as usize]);
+
+    assert!(!client.query_release());
+    client.attest(&oracle, &proof, &claim);
+    assert!(client.verify_claim(&proof, &claim));
+    assert!(client.query_release());
+    assert!(!client.query_release());
+}
+
+#[test]
 fn test_different_proof_not_validated_after_attestation() {
     let (env, _, client) = setup();
     let oracle = Address::generate(&env);

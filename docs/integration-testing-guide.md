@@ -48,6 +48,31 @@ stellar keys show test-account
 
 ## Running Integration Tests
 
+### Oracle-triggered Release on Testnet
+
+This flow deploys both the vault and verifier contracts, attests a fixed-shape
+proof using the verifier's current test stub, and verifies that the vault
+releases to its beneficiary. It spends testnet XLM for fees and transfers one
+unit of the configured token; use funded test accounts only.
+
+Prerequisites:
+- Stellar CLI configured for testnet with funded admin and owner identities
+- `wasm32-unknown-unknown` Rust target installed
+- A testnet SEP-41 token contract ID in `TESTNET_TOKEN_ID`
+- A beneficiary Stellar account address
+
+```bash
+export TESTNET_ADMIN_IDENTITY=admin
+export TESTNET_OWNER_IDENTITY=owner
+export TESTNET_BENEFICIARY_ADDRESS=<beneficiary-address>
+export TESTNET_TOKEN_ID=<testnet-token-contract-id>
+bash scripts/oracle_release_testnet.sh
+```
+
+The proof used here exercises only the verifier's fixed-shape attestation flow;
+it is not a cryptographic proof. The verifier implementation must be replaced
+with the production proof system before treating this flow as a security test.
+
 ### Run All Integration Tests
 
 ```bash
