@@ -327,6 +327,30 @@ fn pick_by_voting(local: &CacheEntry, remote: &CacheEntry) -> CacheEntry {
     }
 }
 
+/// Minimum vote weight needed for a `numerator / denominator` quorum over
+/// `total_supply`, rounded up. Math is done in u128 so `supply * numerator`
+/// cannot overflow. Returns `None` for a zero denominator or a result that
+/// exceeds u64 (only possible when numerator > denominator).
+#[allow(dead_code)]
+pub fn quorum_threshold(total_supply: u64, numerator: u64, denominator: u64) -> Option<u64> {
+    if denominator == 0 {
+        return None;
+    }
+    let product = u128::from(total_supply) * u128::from(numerator);
+    let denominator = u128::from(denominator);
+    u64::try_from(product.div_ceil(denominator)).ok()
+}
+
+/// Whether `votes` meets a `numerator / denominator` quorum over `total_supply`.
+/// Compares `votes * denominator >= total_supply * numerator` in u128, so no
+/// division or overflow is involved. A zero denominator never reaches quorum.
+#[allow(dead_code)]
+pub fn has_quorum(votes: u64, total_supply: u64, numerator: u64, denominator: u64) -> bool {
+    denominator != 0
+        && u128::from(votes) * u128::from(denominator)
+            >= u128::from(total_supply) * u128::from(numerator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +499,56 @@ mod tests {
         let entry = node_a.get("vault:timeout-test").unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().value, "data");
+    }
+
+    #[test]
+    fn naive_u64_quorum_math_would_overflow() {
+        assert!(u64::MAX.checked_mul(2).is_none());
+    }
+
+    #[test]
+    fn quorum_threshold_above_u32_max_over_three() {
+        let supply = u64::from(u32::MAX) / 3 + 1;
+        // 1_431_655_766 * 2 / 3 = 954_437_177.33, rounded up.
+        assert_eq!(quorum_threshold(supply, 2, 3), Some(954_437_178));
+    }
+
+    #[test]
+    fn quorum_threshold_at_u64_max() {
+        assert_eq!(
+            quorum_threshold(u64::MAX, 2, 3),
+            Some(12_297_829_382_473_034_410)
+        );
+        assert_eq!(
+            quorum_threshold(u64::MAX, 51, 100),
+            Some(9_407_839_477_591_871_324)
+        );
+    }
+
+    #[test]
+    fn quorum_threshold_rounds_up_near_u64_max() {
+        // (u64::MAX - 1) * 2 / 3 = ...409.33, rounded up to ...410.
+        assert_eq!(
+            quorum_threshold(u64::MAX - 1, 2, 3),
+            Some(12_297_829_382_473_034_410)
+        );
+        assert_eq!(quorum_threshold(10, 2, 3), Some(7));
+    }
+
+    #[test]
+    fn quorum_threshold_edge_cases() {
+        assert_eq!(quorum_threshold(0, 2, 3), Some(0));
+        assert_eq!(quorum_threshold(100, 2, 0), None);
+        assert_eq!(quorum_threshold(u64::MAX, 3, 3), Some(u64::MAX));
+        assert_eq!(quorum_threshold(u64::MAX, 3, 2), None);
+    }
+
+    #[test]
+    fn has_quorum_at_u64_max_supply() {
+        let threshold = 12_297_829_382_473_034_410;
+        assert!(has_quorum(threshold, u64::MAX, 2, 3));
+        assert!(!has_quorum(threshold - 1, u64::MAX, 2, 3));
+        assert!(has_quorum(u64::MAX, u64::MAX, 3, 3));
+        assert!(!has_quorum(u64::MAX, u64::MAX, 2, 0));
     }
 }
