@@ -617,6 +617,11 @@ pub enum ContractError {
     WhitelistEntryExpired = 150,
     InvalidWhitelistExpiry = 151,
     CheckInTooEarly = 152,
+    // Beneficiary identity oracle (KYC-gated claims)
+    /// Beneficiary has not been attested by the vault's identity oracle.
+    BeneficiaryNotVerified = 153,
+    /// No identity oracle is configured for this vault.
+    IdentityOracleNotSet = 154,
 }
 
 #[contract]
@@ -7615,6 +7620,20 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Released {
             return Err(ContractError::AlreadyReleased);
         }
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::BeneficiaryIdentityOracle(vault_id))
+            && !env
+                .storage()
+                .persistent()
+                .has(&StorageKey::BeneficiaryIdentityVerified(
+                    vault_id,
+                    beneficiary.clone(),
+                ))
+        {
+            return Err(ContractError::BeneficiaryNotVerified);
+        }
         let mut schedule = env
             .storage()
             .persistent()
@@ -12598,6 +12617,81 @@ impl TtlVaultContract {
             .persistent()
             .get(&StorageKey::AcceptanceConditions(vault_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Sets the identity oracle that KYC-gates beneficiary claims for a vault. Owner-only.
+    /// Once set, `claim_beneficiary_vesting` requires the beneficiary to have been verified
+    /// via `verify_beneficiary_identity`.
+    pub fn set_beneficiary_identity_oracle(
+        env: Env,
+        vault_id: u64,
+        oracle_address: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::BeneficiaryIdentityOracle(vault_id), &oracle_address);
+        env.events().publish(
+            (BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC, vault_id),
+            oracle_address,
+        );
+        env.storage().persistent().extend_ttl(
+            &StorageKey::BeneficiaryIdentityOracle(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Records a beneficiary's identity attestation by querying the vault's identity oracle.
+    /// Permissionless: the oracle is the source of truth, so anyone may trigger the check.
+    ///
+    /// # Errors
+    /// * `InvalidBeneficiary` - `beneficiary` is not a beneficiary of the vault
+    /// * `IdentityOracleNotSet` - no identity oracle is configured for the vault
+    /// * `BeneficiaryNotVerified` - the oracle does not attest the beneficiary
+    pub fn verify_beneficiary_identity(
+        env: Env,
+        vault_id: u64,
+        beneficiary: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        if beneficiary != vault.beneficiary
+            && !vault
+                .beneficiaries
+                .iter()
+                .any(|entry| entry.address == beneficiary)
+        {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        let oracle_address = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, Address>(&StorageKey::BeneficiaryIdentityOracle(vault_id))
+            .ok_or(ContractError::IdentityOracleNotSet)?;
+        if !oracle::is_identity_verified(&env, &oracle_address, &beneficiary).unwrap_or(false) {
+            return Err(ContractError::BeneficiaryNotVerified);
+        }
+
+        env.storage().persistent().set(
+            &StorageKey::BeneficiaryIdentityVerified(vault_id, beneficiary.clone()),
+            &true,
+        );
+        env.storage().persistent().extend_ttl(
+            &StorageKey::BeneficiaryIdentityVerified(vault_id, beneficiary.clone()),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        env.events().publish(
+            (BENEFICIARY_IDENTITY_VERIFIED_TOPIC, vault_id),
+            beneficiary,
+        );
+        Ok(())
     }
 
     // --- Issue #399: Dispute Resolution ---

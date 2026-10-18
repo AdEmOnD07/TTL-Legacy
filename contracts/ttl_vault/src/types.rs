@@ -598,6 +598,10 @@ pub enum StorageKey {
     ConflictDisputeWindow(u64),
     /// Owner-designated priority beneficiary address for conflict tie-breaking.
     ConflictPriorityBeneficiary(u64),
+    /// Identity oracle contract address that KYC-gates beneficiary claims for a vault.
+    BeneficiaryIdentityOracle(u64),
+    /// Marks a beneficiary of a vault as identity-verified by the vault's identity oracle.
+    BeneficiaryIdentityVerified(u64, Address),
     BeneficiaryVaultLimit,
     CompromisedPasskeys(u64),
     CountdownConfig(u64),
