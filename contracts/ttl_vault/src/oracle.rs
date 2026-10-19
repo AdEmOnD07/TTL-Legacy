@@ -18,3 +18,25 @@ pub fn query(env: &Env, address: &Address) -> Result<bool, ContractError> {
         _ => Ok(false),
     }
 }
+
+/// Beneficiary identity oracle interface for KYC-gated claims.
+/// Identity oracle contracts must expose an `is_verified` function returning whether
+/// the given beneficiary address has been attested as identity-verified.
+#[contractclient(name = "IdentityOracleClient")]
+pub trait IdentityOracleInterface {
+    fn is_verified(env: Env, beneficiary: Address) -> bool;
+}
+
+/// Queries an identity oracle contract at `address` to see if `beneficiary` has been attested.
+/// Returns `Ok(true)` if the oracle attests the beneficiary, and `Ok(false)` if not or on call failure.
+pub fn is_identity_verified(
+    env: &Env,
+    address: &Address,
+    beneficiary: &Address,
+) -> Result<bool, ContractError> {
+    let client = IdentityOracleClient::new(env, address);
+    match client.try_is_verified(beneficiary) {
+        Ok(Ok(val)) => Ok(val),
+        _ => Ok(false),
+    }
+}
