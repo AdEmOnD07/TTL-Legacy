@@ -18853,6 +18853,64 @@ impl TtlVaultContract {
             .unwrap_or(false)
     }
 
+    // ── Issue #1820: Yield distribution configuration ────────────────────────
+
+    /// Configures how staking yield is distributed between the vault and its
+    /// beneficiaries.
+    ///
+    /// Only the vault owner may call this. The configuration is validated and
+    /// persisted under `StorageKey::YieldDistributionConfig(vault_id)`.
+    ///
+    /// # Arguments
+    /// * `env`      - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    /// * `config`   - The yield distribution configuration to apply
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`     - Caller is not the vault owner
+    /// * `ContractError::InvalidAmount` - Split percentage is out of range (0-100)
+    pub fn set_yield_distribution(
+        env: Env,
+        vault_id: u64,
+        config: YieldDistributionConfig,
+    ) -> Result<(), ContractError> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        // Validate the split percentage when the mode is Split.
+        if let YieldDistributionMode::Split(bps) = config.mode {
+            if bps > 100 {
+                return Err(ContractError::InvalidAmount);
+            }
+        }
+
+        let key = StorageKey::YieldDistributionConfig(vault_id);
+        env.storage().persistent().set(&key, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        Self::log_audit_entry(&env, vault_id, "set_yield_distribution", &vault.owner, "");
+        env.events().publish(
+            (symbol_short!("yld_dist"), vault_id),
+            (vault.owner, config.mode.clone()),
+        );
+        Ok(())
+    }
+
+    /// Returns the yield distribution configuration for a vault, if any.
+    pub fn get_yield_distribution(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<YieldDistributionConfig> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::YieldDistributionConfig(vault_id))
+    }
+
     // ── Issue 3: Low-TTL warning threshold ───────────────────────────────────
 
     /// Sets the per-vault low-TTL warning threshold in seconds.
@@ -19279,5 +19337,113 @@ impl TtlVaultContract {
         );
 
         vault_id
+    }
+
+    // ── Issue #1820: Yield distribution ──────────────────────────────────────
+
+    /// Distributes a staking yield amount according to the vault's configured
+    /// `YieldDistributionConfig`.
+    ///
+    /// Behaviour by mode:
+    /// * `DistributeToBeneficiary` — the full yield is transferred to the
+    ///   vault beneficiary.
+    /// * `Reinvest` — the full yield is added to the vault balance.
+    /// * `Split(bps)` — `bps` percent of the yield goes to the beneficiary and
+    ///   the remainder is reinvested. Rounding is applied so that the two
+    ///   portions always sum exactly to `yield_amount`.
+    ///
+    /// If no configuration exists the yield is reinvested by default.
+    ///
+    /// # Arguments
+    /// * `env`          - The Soroban environment
+    /// * `vault_id`     - The unique identifier of the vault
+    /// * `yield_amount` - The amount of yield to distribute (must be >= 0)
+    ///
+    /// # Returns
+    /// A tuple `(beneficiary_amount, reinvested_amount)` describing how the
+    /// yield was allocated.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - `yield_amount` is negative
+    pub fn distribute_yield(
+        env: Env,
+        vault_id: u64,
+        yield_amount: i128,
+    ) -> Result<(i128, i128), ContractError> {
+        if yield_amount < 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let mut vault = Self::load_vault(&env, vault_id);
+
+        let config = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, YieldDistributionConfig>(&StorageKey::YieldDistributionConfig(
+                vault_id,
+            ))
+            .unwrap_or(YieldDistributionConfig {
+                mode: YieldDistributionMode::Reinvest,
+                total_distributed: 0,
+                total_reinvested: 0,
+                last_distribution: 0,
+            });
+
+        let (beneficiary_amount, reinvested_amount) = match config.mode {
+            YieldDistributionMode::DistributeToBeneficiary => (yield_amount, 0),
+            YieldDistributionMode::Reinvest => (0, yield_amount),
+            YieldDistributionMode::Split(bps) => {
+                // bps is a percentage (0-100). Compute the beneficiary share
+                // first, then derive the reinvested share by subtraction so the
+                // two always sum to `yield_amount` (no rounding loss).
+                let beneficiary = yield_amount
+                    .checked_mul(bps as i128)
+                    .ok_or(ContractError::InvalidAmount)?
+                    / 100;
+                let reinvested = yield_amount - beneficiary;
+                (beneficiary, reinvested)
+            }
+        };
+
+        // Transfer the beneficiary share out of the contract.
+        if beneficiary_amount > 0 {
+            let token_client = token::Client::new(&env, &vault.token_address);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &vault.beneficiary,
+                &beneficiary_amount,
+            );
+        }
+
+        // Reinvested yield increases the vault balance.
+        if reinvested_amount > 0 {
+            vault.balance += reinvested_amount;
+        }
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        // Update running totals and last distribution timestamp.
+        let now = env.ledger().timestamp();
+        let updated = YieldDistributionConfig {
+            mode: config.mode.clone(),
+            total_distributed: config.total_distributed + beneficiary_amount,
+            total_reinvested: config.total_reinvested + reinvested_amount,
+            last_distribution: now,
+        };
+        let key = StorageKey::YieldDistributionConfig(vault_id);
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (symbol_short!("yld_dist"), vault_id),
+            (beneficiary_amount, reinvested_amount),
+        );
+
+        Ok((beneficiary_amount, reinvested_amount))
     }
 }
