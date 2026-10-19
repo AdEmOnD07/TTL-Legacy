@@ -7,6 +7,7 @@ use soroban_sdk::{
 
 pub mod oracle;
 pub mod ranking;
+mod constants;
 mod types;
 pub use oracle::{OracleClient, OracleInterface};
 // The contract's `#[contracttype]` types are re-exported publicly so that
@@ -31,7 +32,6 @@ pub use types::{
     BENEFICIARY_CONFLICT_FILED_TOPIC, BENEFICIARY_CONFLICT_RESOLVED_TOPIC,
     CONFLICT_CLAIMED_TOPIC, CONFLICT_AUTO_RESOLVED_TOPIC,
     CONFLICT_PRIORITY_SET_TOPIC, CONFLICT_DISPUTE_WINDOW_SET_TOPIC,
-    DEFAULT_CONFLICT_DISPUTE_WINDOW, MIN_CONFLICT_DISPUTE_WINDOW, MAX_CONFLICT_DISPUTE_WINDOW,
     BIND_PASSKEY_BIOMETRIC_TOPIC, BIO_CHECKIN_TOPIC, BURN_EVENT_TOPIC,
     BatchWithdrawal, BeneficiaryAuction, BeneficiaryAuctionBid, BeneficiaryConflict,
     BeneficiaryConflictClaim, BeneficiaryEntry, BeneficiaryRebalancedEvent,
@@ -39,7 +39,7 @@ pub use types::{
     BeneficiaryWaterfallEvent, CHECKIN_SCORE_UPDATED_TOPIC, CHECK_IN_RECORDED_TOPIC,
     CLAIM_BENEFICIARY_VESTING_TOPIC, CLAWBACK_UNVESTED_TOPIC, COUNTDOWN_NOTIF_TOPIC,
     ConflictResolution, CustomMetadataEntry, EMERGENCY_RECOVERY_GENERATED_TOPIC,
-    EMERGENCY_RECOVERY_USED_TOPIC, MAX_VESTING_SCHEDULES, MILESTONE_ADJUST_TOPIC,
+    EMERGENCY_RECOVERY_USED_TOPIC, MILESTONE_ADJUST_TOPIC,
     MILESTONE_CLAIM_TOPIC, MILESTONE_EMERGENCY_TOPIC, MILESTONE_PAUSE_TOPIC,
     MILESTONE_PROGRESS_TOPIC, MILESTONE_RESUME_TOPIC, MILESTONE_VEST_TOPIC,
     PASSKEY_COMPROMISED_TOPIC, PASSKEY_EXPIRED_TOPIC, PROTOCOL_CONFIG_APPLIED_TOPIC,
@@ -51,8 +51,8 @@ pub use types::{
     VESTING_STAGGER_TOPIC, Vault, VaultSnapshot, WITHDRAWAL_ESCROW_CREATED_TOPIC,
     WITHDRAWAL_ESCROW_VERIFIED_TOPIC, WITHDRAWAL_PROOF_TOPIC, WITHDRAWAL_RATE_LIMITED_TOPIC,
     WITHDRAWAL_ROLLBACK_TOPIC, WithdrawalEscrow, WithdrawalProof, WithdrawalRateLimit,
-    WithdrawalRollback, ADMIN_TRANSFER_TIMELOCK, DEFAULT_MIN_CHECKIN_COOLDOWN,
-    LOAN_ENABLED_TOPIC, LOAN_REPAID_TOPIC, MAX_ACCELERATE_SECONDS, MILESTONE_ADDED_TOPIC,
+    WithdrawalRollback, ADMIN_TRANSFER_TIMELOCK,
+    LOAN_ENABLED_TOPIC, LOAN_REPAID_TOPIC, MILESTONE_ADDED_TOPIC,
     MILESTONE_ATTESTED_TOPIC, PENDING_MULTISIG_OP_EXPIRY, PROTOCOL_CONFIG_TIMELOCK,
     PasskeyLockout, PasskeyRecoveryRequest, PasskeyRotationPolicy, PauseRecord,
     TWO_FACTOR_DISABLED_TOPIC, TWO_FACTOR_ENABLED_TOPIC, TWO_FACTOR_VERIFIED_TOPIC,
@@ -105,7 +105,6 @@ pub use types::{
     CONDITIONS_ACCEPTED_TOPIC,
     CONFLICT_EXPIRED_TOPIC,
     COUNTDOWN_NOTIF_TOPIC,
-    DEFAULT_MIN_CHECKIN_COOLDOWN,
     DELEGATE_BENEFICIARY_TOPIC,
     DELEGATE_CHECKIN_TOPIC,
     DEPOSIT_TOPIC,
@@ -124,14 +123,6 @@ pub use types::{
     LOAN_ENABLED_TOPIC,
     LOAN_REPAID_TOPIC,
     LOW_TTL_WARNING_TOPIC,
-    MAX_ACCELERATE_SECONDS,
-    MAX_CUSTOM_METADATA_LEN,
-    MAX_DESCRIPTION_LEN,
-    MAX_METADATA_LEN,
-    MAX_NAME_LEN,
-    MAX_NOTES_LEN,
-    MAX_RELEASE_MEMO_LEN,
-    MAX_VESTING_SCHEDULES,
     META_REVERT_TOPIC,
     META_VERSION_TOPIC,
     MILESTONE_ADDED_TOPIC,
@@ -181,7 +172,7 @@ pub use types::{
     PENDING_MULTISIG_OP_EXPIRED_TOPIC,
     PENDING_MULTISIG_OP_EXPIRY,
     PING_EXPIRY_TOPIC,
-    POOL_CREATED_TOPIC,
+    POOL_CREATED_TOPIC, POOL_REDIST_TOPIC,
     PROOF_OF_LIFE_TOPIC,
     PROTOCOL_CONFIG_APPLIED_TOPIC,
     PROTOCOL_CONFIG_PROPOSED_TOPIC,
@@ -267,7 +258,20 @@ pub use types::{
     // Issue #1338: vault export/import for disaster recovery
     VaultExportConfig, VAULT_EXPORTED_TOPIC, VAULT_IMPORTED_TOPIC,
     // Issue #1293: withdrawal history ring buffer
-    WithdrawalEvent, MAX_WITHDRAWAL_HISTORY,
+    WithdrawalEvent,
+};
+pub use constants::{
+    DEFAULT_CONFLICT_DISPUTE_WINDOW, DEFAULT_MIN_CHECKIN_COOLDOWN, MAX_ACCELERATE_SECONDS,
+    MAX_BENEFICIARIES, MAX_CHECK_IN_INTERVAL, MAX_CONFLICT_DISPUTE_WINDOW,
+    MAX_CUSTOM_METADATA_LEN, MAX_DESCRIPTION_LEN, MAX_HIBERNATION_SECONDS, MAX_METADATA_LEN,
+    MAX_NAME_LEN, MAX_NOTES_LEN, MAX_RELEASE_MEMO_LEN, MAX_VESTING_SCHEDULES,
+    MAX_WITHDRAWAL_HISTORY, MIN_CHECK_IN_INTERVAL, MIN_CONFLICT_DISPUTE_WINDOW,
+    MIN_HIBERNATION_SECONDS,
+};
+use constants::{
+    DAYS_PER_YEAR, DEFAULT_MAX_TTL_SECONDS, LEDGER_SECOND, MAX_BATCH_STATUS_SIZE,
+    MAX_PERSISTENT_TTL, MAX_SNAPSHOTS_PER_VAULT, MAX_VAULT_BATCH_SIZE, SECONDS_PER_DAY,
+    SECONDS_PER_HOUR,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -280,6 +284,8 @@ mod beneficiary_vesting_auction_tests;
 mod beneficiary_vesting_tests;
 #[cfg(test)]
 mod bps_invariant_tests;
+#[cfg(test)]
+mod waterfall_proptests;
 #[cfg(test)]
 mod event_emission_tests;
 // Issue #1288: multi-beneficiary vault with percentage-based splits
@@ -375,28 +381,8 @@ pub const INSTANCE_TTL_THRESHOLD: u32 = 1000;
 /// Extended on every state-mutating call to keep contract instance alive.
 pub const INSTANCE_TTL_LEDGERS: u32 = 200_000;
 
-/// Approximate ledger close time in seconds (Stellar mainnet ~5s).
-const LEDGER_SECOND: u32 = 5;
-/// Number of seconds in one minute.
-const SECONDS_PER_MINUTE: u64 = 60;
-/// Number of seconds in one hour.
-const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
-/// Number of seconds in one day.
-const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
-/// Number of days in the simplified financial-year calculation.
-const DAYS_PER_YEAR: u64 = 365;
 /// Basis points representing 100%.
 pub const BASIS_POINTS_100_PERCENT: i128 = 10_000;
-/// Default maximum vault TTL (10 years, in seconds).
-const DEFAULT_MAX_TTL_SECONDS: u64 = 10 * DAYS_PER_YEAR * SECONDS_PER_DAY;
-/// Soroban maximum persistent entry TTL in ledgers (~180 days at 5s/ledger).
-const MAX_PERSISTENT_TTL: u32 = 3_110_400;
-/// Maximum number of snapshots retained per vault.
-const MAX_SNAPSHOTS_PER_VAULT: u32 = 1_000;
-/// Maximum number of vault IDs accepted by `get_vault_batch_status` in a single call.
-const MAX_BATCH_STATUS_SIZE: u32 = 100;
-/// Maximum number of vault IDs accepted by `get_vault_batch` in a single call.
-const MAX_VAULT_BATCH_SIZE: u32 = 50;
 
 /// Two-step ownership transfer constants - Issue #1119
 /// 24-hour time-lock before new owner can accept the transfer (in seconds)
@@ -408,17 +394,6 @@ pub const OWNERSHIP_TRANSFER_EXPIRY: u64 = 604_800;
 /// 72-hour time-lock before upgrade can be executed (in seconds)
 pub const UPGRADE_TIMELOCK: u64 = 259_200; // 72 hours
 
-/// Minimum hibernation duration in seconds - Issue #1280.
-/// Mirrors `MIN_CHECK_IN_INTERVAL`: a hibernation shorter than the shortest
-/// allowed check-in interval provides no meaningful relief from check-ins,
-/// so durations below this (including zero, i.e. an instant no-op) are rejected.
-pub const MIN_HIBERNATION_SECONDS: u64 = 3600; // 1 hour
-
-/// Maximum hibernation duration in seconds.
-/// Soroban's maximum persistent entry TTL is 3_110_400 ledgers at ~5 s/ledger ≈ 180 days.
-/// We cap hibernation at that ceiling so storage extension can never fail.
-pub const MAX_HIBERNATION_SECONDS: u64 = 15_552_000; // 180 days
-
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
 /// interval, capped at the Soroban maximum.
@@ -428,20 +403,6 @@ fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
         .saturating_div(LEDGER_SECOND);
     ledgers.clamp(VAULT_TTL_LEDGERS, MAX_PERSISTENT_TTL)
 }
-
-/// Minimum check-in interval: 1 hour (3600 seconds)
-/// Prevents abuse of TTL extension mechanisms with unreasonably short intervals
-pub const MIN_CHECK_IN_INTERVAL: u64 = 3600;
-
-/// Maximum check-in interval: 10 years (315_360_000 seconds)
-/// Issue #1165: an unconditional ceiling — independent of the optional
-/// admin-configured MaxCheckInInterval — prevents an astronomically large
-/// interval (e.g. near u64::MAX) from overflowing TTL arithmetic or making
-/// automatic release practically unreachable.
-pub const MAX_CHECK_IN_INTERVAL: u64 = 315_360_000;
-
-/// Maximum number of beneficiaries allowed per vault.
-pub const MAX_BENEFICIARIES: u32 = 20;
 
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -617,6 +578,8 @@ pub enum ContractError {
     WhitelistEntryExpired = 150,
     InvalidWhitelistExpiry = 151,
     CheckInTooEarly = 152,
+    // Issue #1806: beneficiary auction reserve price
+    ReserveNotMet = 153,
 }
 
 #[contract]
@@ -7732,6 +7695,43 @@ impl TtlVaultContract {
         Ok(())
     }
 
+    /// Set the minimum winning bid for a beneficiary auction - Issue #1806
+    /// Finalization is rejected if the highest bid is below this amount.
+    pub fn set_auction_reserve_price(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        min_amount: i128,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if min_amount < 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let auction = env
+            .storage()
+            .persistent()
+            .get::<_, BeneficiaryAuction>(&StorageKey::BeneficiaryAuction(vault_id))
+            .ok_or(ContractError::AuctionNotFound)?;
+        if auction.finalized {
+            return Err(ContractError::AuctionEnded);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::BeneficiaryAuctionReserve(vault_id), &min_amount);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::BeneficiaryAuctionReserve(vault_id),
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        Ok(())
+    }
+
     /// Place a bid in a beneficiary auction - Issue #527
     pub fn place_auction_bid(
         env: Env,
@@ -7818,16 +7818,26 @@ impl TtlVaultContract {
             return Ok(());
         }
 
-        // Find highest bidder
+        // Find highest bidder; on equal amounts the earliest bid wins
         let winner_idx = auction
             .bids
             .iter()
             .enumerate()
-            .max_by_key(|(_, bid)| bid.bid_amount)
+            .max_by_key(|(idx, bid)| (bid.bid_amount, core::cmp::Reverse(*idx)))
             .map(|(idx, _)| idx)
             .ok_or(ContractError::AuctionNotFound)?;
 
-        let winner = auction.bids.get(winner_idx as u32).unwrap().bidder.clone();
+        let winning_bid = auction.bids.get(winner_idx as u32).unwrap();
+        let reserve = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&StorageKey::BeneficiaryAuctionReserve(vault_id))
+            .unwrap_or(0);
+        if winning_bid.bid_amount < reserve {
+            return Err(ContractError::ReserveNotMet);
+        }
+
+        let winner = winning_bid.bidder.clone();
         auction.winner = Some(winner.clone());
         auction.finalized = true;
 
@@ -17567,6 +17577,7 @@ impl TtlVaultContract {
             ttl_remaining,
             balance: vault.balance,
             is_paused: vault.is_paused,
+            check_in_streak: Self::get_check_in_streak(env.clone(), vault_id),
         })
     }
 
@@ -17761,6 +17772,8 @@ impl TtlVaultContract {
             pool_id,
             members: members.clone(),
             total_bps,
+            claim_deadline: 0,
+            claimed: Vec::new(&env),
         };
         env.storage()
             .persistent()
@@ -17776,6 +17789,145 @@ impl TtlVaultContract {
         env.events()
             .publish((POOL_CREATED_TOPIC, pool_id), (members, total_bps));
         Ok(())
+    }
+
+    /// Sets the claim deadline for a pool. Only the vault owner may call this.
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`           - caller is not the vault owner
+    /// * `ContractError::InvalidBeneficiary` - pool does not exist
+    /// * `ContractError::InvalidDeadline`    - deadline is not in the future
+    pub fn set_pool_claim_deadline(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        pool_id: u64,
+        claim_deadline: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if claim_deadline <= env.ledger().timestamp() {
+            return Err(ContractError::InvalidDeadline);
+        }
+        let key = StorageKey::BeneficiaryPool(pool_id);
+        let mut pool: BeneficiaryPool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvalidBeneficiary)?;
+        pool.claim_deadline = claim_deadline;
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Records that `member` has claimed their pool share before the claim deadline.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidBeneficiary` - pool does not exist
+    /// * `ContractError::NotBeneficiary`     - member is not in the pool
+    /// * `ContractError::InvalidDeadline`    - the claim deadline has already passed
+    pub fn claim_pool_share(
+        env: Env,
+        pool_id: u64,
+        member: Address,
+    ) -> Result<(), ContractError> {
+        member.require_auth();
+        Self::assert_not_paused(&env);
+        let key = StorageKey::BeneficiaryPool(pool_id);
+        let mut pool: BeneficiaryPool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvalidBeneficiary)?;
+        if !pool.members.contains(&member) {
+            return Err(ContractError::NotBeneficiary);
+        }
+        if pool.claim_deadline != 0 && env.ledger().timestamp() > pool.claim_deadline {
+            return Err(ContractError::InvalidDeadline);
+        }
+        if !pool.claimed.contains(&member) {
+            pool.claimed.push_back(member);
+        }
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Redistributes unclaimed pool shares to the members that claimed, proportionally
+    /// to their BPS, once the pool's claim deadline has passed.
+    ///
+    /// The resulting BPS per claimed member (aligned with `pool.claimed`) is stored under
+    /// `BeneficiaryPoolAlloc(pool_id)` and sums to the pool's `total_bps` (rounding dust
+    /// goes to the first claimed member). Callable by anyone.
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidBeneficiary` - pool missing, or nobody claimed
+    /// * `ContractError::NotExpired`         - no deadline set or deadline not yet passed
+    pub fn redistribute_unclaimed_pool_shares(
+        env: Env,
+        vault_id: u64,
+        pool_id: u64,
+    ) -> Result<Vec<u128>, ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        let pool: BeneficiaryPool = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::BeneficiaryPool(pool_id))
+            .ok_or(ContractError::InvalidBeneficiary)?;
+        if pool.claim_deadline == 0 || env.ledger().timestamp() <= pool.claim_deadline {
+            return Err(ContractError::NotExpired);
+        }
+        if pool.claimed.is_empty() {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        let mut claimed_bps: u128 = 0;
+        let mut own_bps: Vec<u128> = Vec::new(&env);
+        for member in pool.claimed.iter() {
+            let mut bps: u128 = 0;
+            for entry in vault.beneficiaries.iter() {
+                if entry.address == member {
+                    bps = entry.bps as u128;
+                    break;
+                }
+            }
+            claimed_bps += bps;
+            own_bps.push_back(bps);
+        }
+        if claimed_bps == 0 {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        let total = pool.total_bps as u128;
+        let mut alloc: Vec<u128> = Vec::new(&env);
+        let mut assigned: u128 = 0;
+        for bps in own_bps.iter() {
+            let share = total * bps / claimed_bps;
+            assigned += share;
+            alloc.push_back(share);
+        }
+        if let Some(first) = alloc.get(0) {
+            alloc.set(0, first + (total - assigned));
+        }
+
+        let key = StorageKey::BeneficiaryPoolAlloc(pool_id);
+        env.storage().persistent().set(&key, &alloc);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.events()
+            .publish((POOL_REDIST_TOPIC, pool_id), alloc.clone());
+        Ok(alloc)
     }
 
     /// Returns the pool record for `pool_id`, if it exists.

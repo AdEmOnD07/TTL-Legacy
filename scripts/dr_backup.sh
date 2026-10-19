@@ -20,10 +20,9 @@
 #   AWS_SECRET_ACCESS_KEY S3 credentials
 #   AWS_REGION            AWS region                     (default: us-east-1)
 #   DR_WASM_PATH          Path to compiled WASM          (default: auto-detected)
-#
-# Every uploaded artefact gets a detached GPG signature (<key>.sig) so that
-# dr_restore.sh can verify it before restoring.
-#   DR_GPG_KEY_ID         GPG key ID or email used to sign artefacts (required)
+#   DR_REPLICA_BUCKET     Second bucket in another region for cross-region
+#                         replication (3-2-1). Replication is skipped if unset.
+#   DR_REPLICA_REGION     Region of the replica bucket   (required with DR_REPLICA_BUCKET)
 
 set -euo pipefail
 
@@ -60,6 +59,10 @@ run() {
 : "${DR_DB_PATH:?DR_DB_PATH is required}"
 : "${DR_GPG_KEY_ID:?DR_GPG_KEY_ID is required}"
 
+if [[ -n "${DR_REPLICA_BUCKET:-}" ]]; then
+    : "${DR_REPLICA_REGION:?DR_REPLICA_REGION is required when DR_REPLICA_BUCKET is set}"
+fi
+
 DR_S3_PREFIX="${DR_S3_PREFIX:-backups}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
@@ -69,6 +72,9 @@ log "Starting disaster-recovery backup"
 log "  Network   : ${STELLAR_NETWORK}"
 log "  Contract  : ${CONTRACT_TTL_VAULT}"
 log "  Bucket    : s3://${DR_S3_BUCKET}/${BACKUP_KEY_PREFIX}/"
+if [[ -n "${DR_REPLICA_BUCKET:-}" ]]; then
+    log "  Replica   : s3://${DR_REPLICA_BUCKET}/${BACKUP_KEY_PREFIX}/ (${DR_REPLICA_REGION})"
+fi
 log "  Timestamp : ${TIMESTAMP}"
 
 # ---------------------------------------------------------------------------
@@ -141,6 +147,13 @@ upload_to_s3() {
     run aws s3 cp "${local_path}" "s3://${DR_S3_BUCKET}/${s3_key}" \
         --endpoint-url "${DR_S3_ENDPOINT}" \
         --region "${AWS_REGION}"
+
+    if [[ -n "${DR_REPLICA_BUCKET:-}" ]]; then
+        log "Replicating ${s3_key} -> s3://${DR_REPLICA_BUCKET}/${s3_key} (${DR_REPLICA_REGION})"
+        run aws s3 cp "${local_path}" "s3://${DR_REPLICA_BUCKET}/${s3_key}" \
+            --endpoint-url "${DR_S3_ENDPOINT}" \
+            --region "${DR_REPLICA_REGION}"
+    fi
 }
 
 # Sign the artefact with a detached GPG signature, then upload both files.
@@ -169,6 +182,15 @@ fi
 # 5. Write backup manifest
 # ---------------------------------------------------------------------------
 
+# Prints the SHA-256 of a file as a JSON string, or null if the file is absent.
+json_sha256() {
+    if [[ -f "$1" ]]; then
+        echo "\"$(sha256sum "$1" | cut -d' ' -f1)\""
+    else
+        echo null
+    fi
+}
+
 MANIFEST_FILE=$(mktemp /tmp/manifest_XXXXXX.json)
 cat > "${MANIFEST_FILE}" <<EOF
 {
@@ -179,6 +201,11 @@ cat > "${MANIFEST_FILE}" <<EOF
     "contract_state": "${BACKUP_KEY_PREFIX}/contract_state.json",
     "backend_db": "$(if $SKIP_DB; then echo null; else echo "\"${BACKUP_KEY_PREFIX}/backend_db.sqlite3\""; fi)",
     "wasm": "$(if $SKIP_WASM; then echo null; else echo "\"${BACKUP_KEY_PREFIX}/ttl_vault.wasm\""; fi)"
+  },
+  "sha256": {
+    "contract_state": $(json_sha256 "${CONTRACT_STATE_FILE}"),
+    "backend_db": $(json_sha256 "${DB_SNAPSHOT_FILE:-}"),
+    "wasm": $(json_sha256 "${WASM_PATH}")
   }
 }
 EOF
