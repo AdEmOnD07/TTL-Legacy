@@ -268,6 +268,8 @@ pub use types::{
     VaultExportConfig, VAULT_EXPORTED_TOPIC, VAULT_IMPORTED_TOPIC,
     // Issue #1293: withdrawal history ring buffer
     WithdrawalEvent, MAX_WITHDRAWAL_HISTORY,
+    // Issue #1836: vault-scoped bridge config and bridge deposit events
+    VAULT_BRIDGE_CONFIG_SET_TOPIC, VAULT_BRIDGE_DEPOSIT_TOPIC,
 };
 #[cfg(test)]
 mod beneficiary_auction_tests;
@@ -617,6 +619,11 @@ pub enum ContractError {
     WhitelistEntryExpired = 150,
     InvalidWhitelistExpiry = 151,
     CheckInTooEarly = 152,
+    // Issue #1836: vault-scoped bridge configuration
+    /// No bridge config has been set for this vault.
+    BridgeNotConfigured = 153,
+    /// The bridge registered for this vault is not active.
+    BridgeNotActive = 154,
 }
 
 #[contract]
@@ -1116,6 +1123,114 @@ impl TtlVaultContract {
         } else {
             false
         }
+    }
+
+    // --- Issue #1836: Vault-scoped bridge configuration for cross-chain deposits ---
+
+    /// Sets the bridge configuration for a specific vault.
+    ///
+    /// The vault owner designates which chain and bridge contract to use for
+    /// cross-chain deposits into this vault. This does not replace the global
+    /// admin-level bridge registry; it is a per-vault override that selects
+    /// which registered bridge the vault will accept deposits from.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault to configure
+    /// * `config` - The `BridgeConfig` to associate with this vault
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the vault owner
+    /// * Panics if the vault does not exist
+    pub fn set_bridge_config(env: Env, vault_id: u64, config: BridgeConfig) {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+        let key = StorageKey::VaultBridgeConfig(vault_id);
+        env.storage().persistent().set(&key, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (VAULT_BRIDGE_CONFIG_SET_TOPIC, vault_id),
+            (config.chain_id, config.bridge_address),
+        );
+    }
+
+    /// Gets the vault-scoped bridge configuration, if set.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    ///
+    /// # Returns
+    /// `Some(BridgeConfig)` if a config has been set for this vault, `None` otherwise
+    pub fn get_vault_bridge_config(env: Env, vault_id: u64) -> Option<BridgeConfig> {
+        let key = StorageKey::VaultBridgeConfig(vault_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Records a cross-chain deposit into a vault via the vault's configured bridge.
+    ///
+    /// This function validates that the vault has a bridge config set, that the
+    /// bridge is active, and that the source chain matches the configured chain.
+    /// It then credits `amount` to the vault balance, mirroring how a native
+    /// deposit would be processed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The destination vault
+    /// * `source_chain` - The chain ID the deposit originates from
+    /// * `amount` - The amount to credit (in stroops / base units)
+    ///
+    /// # Panics
+    /// * Panics if no bridge config has been set for this vault (`BridgeNotConfigured`)
+    /// * Panics if the bridge is not active (`BridgeNotActive`)
+    /// * Panics if `source_chain` does not match the configured chain (`InvalidConfig`)
+    /// * Panics if `amount` is not positive (`InvalidAmount`)
+    /// * Panics if the vault is not in `Locked` status (`VaultReleased`)
+    /// * Panics if the vault has expired (`VaultExpired`)
+    pub fn bridge_deposit(env: Env, vault_id: u64, source_chain: u32, amount: i128) {
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        let bridge_config: BridgeConfig = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, BridgeConfig>(&StorageKey::VaultBridgeConfig(vault_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BridgeNotConfigured));
+        if !bridge_config.is_active {
+            panic_with_error!(&env, ContractError::BridgeNotActive);
+        }
+        if bridge_config.chain_id != source_chain {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::Locked {
+            panic_with_error!(&env, ContractError::VaultReleased);
+        }
+        let now = env.ledger().timestamp();
+        if now >= vault.last_check_in + vault.check_in_interval {
+            panic_with_error!(&env, ContractError::VaultExpired);
+        }
+        vault.balance = vault
+            .balance
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
+        let vault_key = StorageKey::Vault(vault_id);
+        env.storage().persistent().set(&vault_key, &vault);
+        env.storage()
+            .persistent()
+            .extend_ttl(&vault_key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (VAULT_BRIDGE_DEPOSIT_TOPIC, vault_id),
+            (source_chain, amount),
+        );
     }
 
     /// Validates that a new WASM hash is safe to upgrade to.
