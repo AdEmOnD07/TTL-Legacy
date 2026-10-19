@@ -15,8 +15,8 @@ pub use oracle::{OracleClient, OracleInterface};
 pub use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryClaimDelegation, BeneficiaryCommitment,
     BeneficiaryPool, BeneficiaryRotationEntry, BeneficiaryStatus, BridgeConfig,
-    CheckInHistoryEntry, CheckInStreak, ConditionalAcceptanceEntry, StorageKey, DisputeStatus,
-    GeoCheckInEntry, HibernationEntry, IntegrityReport, MetadataVersionEntry,
+    CheckInHistoryEntry, CheckInStreak, ConditionalAcceptanceEntry, DepositHistoryEntry,
+    StorageKey, DisputeStatus, GeoCheckInEntry, HibernationEntry, IntegrityReport, MetadataVersionEntry,
     MilestoneEntry, MilestoneVestingSchedule, MultiSigConfig, MultiSigOperation, MultiSigProposal,
     OwnershipProof, OwnershipTransferRequest, PasskeyAnalytics, PasskeyHash, PasskeyUsageEntry,
     PendingBeneficiaryUpdate, PendingMultiSigOp, ProofOfLifeEntry, ProposalStatus,
@@ -371,6 +371,9 @@ pub const VAULT_TTL_THRESHOLD: u32 = 1000;
 /// 200_000 ledgers × 5 s/ledger ≈ 11.6 days.
 /// Used as the floor in `vault_ttl_ledgers`; long-interval vaults get a larger value.
 pub const VAULT_TTL_LEDGERS: u32 = 200_000;
+
+/// Maximum number of deposit history entries kept per vault (oldest dropped first).
+pub const DEPOSIT_HISTORY_CAP: u32 = 100;
 
 /// Minimum TTL (in ledgers) before instance storage is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -2262,6 +2265,7 @@ impl TtlVaultContract {
             .checked_add(amount)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
         Self::save_vault(&env, vault_id, &vault);
+        Self::record_deposit_history(&env, vault_id, &from, amount, vault.balance, now);
         Self::log_audit_entry(&env, vault_id, "deposit", &from, "");
         Self::append_activity_log(&env, vault_id, "deposit", &from, "");
         env.storage()
@@ -2350,6 +2354,7 @@ impl TtlVaultContract {
                 .checked_add(amount)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
             Self::save_vault(&env, vault_id, &vault);
+            Self::record_deposit_history(&env, vault_id, &from, amount, vault.balance, now);
 
             // Issue #582: Emit token whitelist validation event
             env.events().publish(
@@ -14929,6 +14934,40 @@ impl TtlVaultContract {
         result
     }
 
+    /// Returns a paginated page of the deposit history for a vault.
+    ///
+    /// Holds up to the last `DEPOSIT_HISTORY_CAP` (100) deposits; older entries
+    /// are dropped as new ones arrive. Entries are returned oldest-first.
+    /// Returns an empty vec if `page` is beyond the available entries.
+    ///
+    /// # Arguments
+    /// * `vault_id`  - The vault whose history to query
+    /// * `page`      - Zero-based page number
+    /// * `page_size` - Number of entries per page (automatically capped at 100)
+    pub fn get_deposit_history(
+        env: Env,
+        vault_id: u64,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<DepositHistoryEntry> {
+        let page_size = page_size.min(DEPOSIT_HISTORY_CAP);
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
+        let history: Vec<DepositHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DepositHistory(vault_id))
+            .unwrap_or(Vec::new(&env));
+        let start = page.saturating_mul(page_size);
+        let end = start.saturating_add(page_size).min(history.len());
+        let mut result: Vec<DepositHistoryEntry> = Vec::new(&env);
+        for i in start..end {
+            result.push_back(history.get_unchecked(i));
+        }
+        result
+    }
+
     /// Returns the current check-in streak for a vault.
     pub fn get_check_in_streak(env: Env, vault_id: u64) -> CheckInStreak {
         env.storage()
@@ -15449,6 +15488,39 @@ impl TtlVaultContract {
 
         Self::check_whitelisted(env, vault_id, destination)?;
         Ok(updated_vault)
+    }
+
+    // ── Issue #1767: deposit history helpers ─────────────────────────────────
+
+    /// Appends a deposit to the vault's history, dropping the oldest entry once
+    /// the list holds `DEPOSIT_HISTORY_CAP` entries.
+    fn record_deposit_history(
+        env: &Env,
+        vault_id: u64,
+        depositor: &Address,
+        amount: i128,
+        new_balance: i128,
+        timestamp: u64,
+    ) {
+        let key = StorageKey::DepositHistory(vault_id);
+        let mut history: Vec<DepositHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+        if history.len() >= DEPOSIT_HISTORY_CAP {
+            history.pop_front();
+        }
+        history.push_back(DepositHistoryEntry {
+            depositor: depositor.clone(),
+            amount,
+            new_balance,
+            timestamp,
+        });
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
     }
 
     // ── Issue #482: check-in history helpers ─────────────────────────────────

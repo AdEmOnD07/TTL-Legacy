@@ -435,6 +435,8 @@ pub enum StorageKey {
     VaultSnapshotTimestamps(u64),
     // Issue #482: TTL prediction history
     CheckInHistory(u64),
+    // Issue #1767: capped list of recent deposit events for audit queries
+    DepositHistory(u64),
     // Issue #873: individual check-in history entry for paginated access
     CheckInEntry(u64, u32),
     // Issue #873: ring buffer head pointer for check-in history
@@ -603,6 +605,16 @@ pub enum StorageKey {
 #[contracttype]
 #[derive(Clone)]
 pub struct CheckInHistoryEntry {
+    pub timestamp: u64,
+}
+
+/// Deposit history entry for audit queries - Issue #1767
+#[contracttype]
+#[derive(Clone)]
+pub struct DepositHistoryEntry {
+    pub depositor: Address,
+    pub amount: i128,
+    pub new_balance: i128,
     pub timestamp: u64,
 }
 
