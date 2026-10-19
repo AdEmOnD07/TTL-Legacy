@@ -12,15 +12,35 @@ use ttl_vault::{ReleaseStatus, TtlVaultContract, TtlVaultContractClient};
 
 /// Integration test configuration (kept for live testnet use)
 pub struct TestnetConfig {
-    pub rpc_url: &'static str,
+    pub rpc_url: String,
     pub network_passphrase: &'static str,
     pub contract_id: Option<&'static str>,
 }
 
+/// Parse `KEY=VALUE` lines from `environments.toml` and return the value for
+/// the given key, or `None` if the key is absent.
+fn parse_env_toml_value(key: &str) -> Option<String> {
+    let contents = include_str!("../../../environments.toml");
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 impl TestnetConfig {
     pub fn testnet() -> Self {
+        let rpc_url = parse_env_toml_value("STELLAR_RPC_URL")
+            .expect("STELLAR_RPC_URL not found in environments.toml");
         Self {
-            rpc_url: "https://soroban-testnet.stellar.org",
+            rpc_url,
             network_passphrase: "Test SDF Network ; September 2015",
             contract_id: None,
         }
