@@ -2,12 +2,19 @@ use crate::models::{
     AuditEntry, AuditLogEntry, AuditLogQuery, Channel, Frequency, Passkey, RecoveryCode,
     RecoveryCodeSet, ReminderPreferences, SearchQuery, SearchResult, Subscription,
     SubscriptionChannel, SubscriptionFrequency, Vault, VaultBackup, VaultEvent,
-    VaultNotificationPreferences, VaultShare, VaultStatus,
+    VaultNotificationPreferences, VaultShare, VaultStatus, WebhookSubscription,
 };
 
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+mod auth;
+mod notifications;
+mod vault;
+
+pub use notifications::*;
+pub use vault::*;
 
 pub type VaultStore = Arc<Mutex<HashMap<String, Vault>>>;
 pub type EventStore = Arc<Mutex<Vec<VaultEvent>>>;
@@ -83,225 +90,6 @@ pub struct AppState {
     pub recovery_code_set_store: RecoveryCodeSetStore,
 }
 
-pub fn search_vaults(store: &VaultStore, query: &SearchQuery) -> SearchResult {
-    let vaults = store.lock().unwrap();
-    let limit = query.limit.unwrap_or(20).clamp(1, 100);
-
-    let mut filtered: Vec<Vault> = vaults
-        .values()
-        .filter(|v| {
-            if let Some(ref owner) = query.owner {
-                if v.owner != *owner {
-                    return false;
-                }
-            }
-            if let Some(ref beneficiary) = query.beneficiary {
-                if v.beneficiary != *beneficiary {
-                    return false;
-                }
-            }
-            if let Some(ref status) = query.status {
-                if v.status != *status {
-                    return false;
-                }
-            }
-            if let Some(after) = query.created_after {
-                if v.created_at < after {
-                    return false;
-                }
-            }
-            if let Some(before) = query.created_before {
-                if v.created_at > before {
-                    return false;
-                }
-            }
-            true
-        })
-        .cloned()
-        .collect();
-
-    // Stable ordering by vault ID so cursors are deterministic.
-    filtered.sort_by(|a, b| a.id.cmp(&b.id));
-
-    // Apply cursor: skip everything up to and including the cursor vault ID.
-    if let Some(ref cursor) = query.cursor {
-        let pos = filtered.iter().position(|v| &v.id == cursor);
-        if let Some(idx) = pos {
-            filtered = filtered.into_iter().skip(idx + 1).collect();
-        }
-    }
-
-    let mut paginated: Vec<Vault> = filtered.into_iter().take(limit as usize + 1).collect();
-    let next_cursor = if paginated.len() > limit as usize {
-        paginated.pop().map(|v| v.id.clone())
-    } else {
-        None
-    };
-
-    SearchResult {
-        vaults: paginated,
-        next_cursor,
-        limit,
-    }
-}
-
-pub fn get_vault_history(event_store: &EventStore, vault_id: &str) -> Vec<VaultEvent> {
-    event_store
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|e| e.vault_id == vault_id)
-        .cloned()
-        .collect()
-}
-
-pub fn get_vault_audit_log(audit_store: &AuditStore, vault_id: &str) -> Vec<AuditEntry> {
-    audit_store
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|a| {
-            a.details
-                .get("vault_id")
-                .map_or(false, |v| v.as_str() == Some(vault_id))
-        })
-        .cloned()
-        .collect()
-}
-
-// ── Task 1: Analytics ────────────────────────────────────────────────────────
-
-pub fn compute_vault_analytics(store: &VaultStore) -> crate::models::VaultAnalytics {
-    use crate::models::{TimeSeriesPoint, VaultAnalytics, VaultStatus};
-    use std::collections::BTreeMap;
-
-    let vaults = store.lock().unwrap();
-    let total_vaults = vaults.len() as u64;
-    let active_vaults = vaults
-        .values()
-        .filter(|v| v.status == VaultStatus::Active)
-        .count() as u64;
-    let released_vaults = vaults
-        .values()
-        .filter(|v| v.status == VaultStatus::Released)
-        .count() as u64;
-
-    let avg_ttl = if total_vaults > 0 {
-        vaults
-            .values()
-            .map(|v| v.check_in_interval as f64)
-            .sum::<f64>()
-            / total_vaults as f64
-    } else {
-        0.0
-    };
-
-    let release_rate = if total_vaults > 0 {
-        released_vaults as f64 / total_vaults as f64
-    } else {
-        0.0
-    };
-
-    // Build daily time-series bucketed by creation date
-    let mut created_by_day: BTreeMap<String, u64> = BTreeMap::new();
-    let mut released_by_day: BTreeMap<String, u64> = BTreeMap::new();
-    for v in vaults.values() {
-        let day = v.created_at.format("%Y-%m-%d").to_string();
-        *created_by_day.entry(day.clone()).or_insert(0) += 1;
-        if v.status == VaultStatus::Released {
-            *released_by_day.entry(day).or_insert(0) += 1;
-        }
-    }
-
-    let all_days: std::collections::BTreeSet<String> = created_by_day
-        .keys()
-        .chain(released_by_day.keys())
-        .cloned()
-        .collect();
-
-    let time_series = all_days
-        .into_iter()
-        .map(|date| TimeSeriesPoint {
-            vaults_created: *created_by_day.get(&date).unwrap_or(&0),
-            vaults_released: *released_by_day.get(&date).unwrap_or(&0),
-            date,
-        })
-        .collect();
-
-    VaultAnalytics {
-        total_vaults,
-        active_vaults,
-        average_ttl_seconds: avg_ttl,
-        release_rate,
-        time_series,
-    }
-}
-
-// ── Task 2: Backup & Recovery ─────────────────────────────────────────────────
-
-pub fn store_backup(backup_store: &BackupStore, backup: crate::models::VaultBackup) {
-    backup_store
-        .lock()
-        .unwrap()
-        .insert(backup.backup_id.clone(), backup);
-}
-
-pub fn get_backup(
-    backup_store: &BackupStore,
-    backup_id: &str,
-) -> Option<crate::models::VaultBackup> {
-    backup_store.lock().unwrap().get(backup_id).cloned()
-}
-
-// ── Task 3: Sharing ───────────────────────────────────────────────────────────
-
-pub fn add_vault_share(share_store: &ShareStore, share: crate::models::VaultShare) {
-    share_store.lock().unwrap().push(share);
-}
-
-pub fn get_vault_shares(
-    share_store: &ShareStore,
-    vault_id: &str,
-) -> Vec<crate::models::VaultShare> {
-    share_store
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|s| s.vault_id == vault_id)
-        .cloned()
-        .collect()
-}
-
-// ── Share token persistence ──────────────────────────────────────────────────
-
-pub fn add_share_token(store: &ShareTokenStore, token: ShareToken) {
-    store.lock().unwrap().insert(token.token.clone(), token);
-}
-
-pub fn get_share_token(store: &ShareTokenStore, token: &str) -> Option<ShareToken> {
-    store.lock().unwrap().get(token).cloned()
-}
-
-pub fn get_vault_share_tokens(store: &ShareTokenStore, vault_id: &str) -> Vec<ShareToken> {
-    store
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|t| t.vault_id == vault_id)
-        .cloned()
-        .collect()
-}
-
-pub fn revoke_share_token(store: &ShareTokenStore, token: &str) -> Option<ShareToken> {
-    let mut lock = store.lock().unwrap();
-    if let Some(t) = lock.get_mut(token) {
-        t.revoked = true;
-        Some(t.clone())
-    } else {
-        None
-    }
-}
-
 // ── Audit helper ─────────────────────────────────────────────────────────────
 
 pub fn append_audit_entry(
@@ -316,25 +104,6 @@ pub fn append_audit_entry(
         actor: actor.to_string(),
         details,
     });
-}
-
-// ── Task 4: Notification Preferences ─────────────────────────────────────────
-
-pub fn set_notification_preferences(
-    notif_store: &NotificationStore,
-    prefs: crate::models::VaultNotificationPreferences,
-) {
-    notif_store
-        .lock()
-        .unwrap()
-        .insert(prefs.owner.clone(), prefs);
-}
-
-pub fn get_notification_preferences(
-    notif_store: &NotificationStore,
-    owner: &str,
-) -> Option<crate::models::VaultNotificationPreferences> {
-    notif_store.lock().unwrap().get(owner).cloned()
 }
 
 // ── TTL Insurance persistence (SQLite) ───────────────────────────────────────
@@ -616,19 +385,6 @@ impl Db {
             },
             vault_store: create_vault_store(),
         })
-    }
-
-    /// Insert or replace a vault in the in-memory store.
-    pub fn insert_vault(&self, vault: crate::models::Vault) {
-        self.vault_store
-            .lock()
-            .unwrap()
-            .insert(vault.id.clone(), vault);
-    }
-
-    /// Retrieve a vault from the in-memory store by string ID.
-    pub fn get_vault(&self, vault_id: &str) -> Option<crate::models::Vault> {
-        self.vault_store.lock().unwrap().get(vault_id).cloned()
     }
 
     pub fn check_connectivity(&self) -> Result<(), rusqlite::Error> {
@@ -1083,6 +839,30 @@ impl Db {
         }
     }
 
+    pub fn get_webhook_subscriptions_for_vault(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<WebhookSubscription>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"SELECT id, vault_id, endpoint_url, event_types, created_at
+               FROM webhook_subscriptions
+               WHERE vault_id = ?1"#,
+        )?;
+        let rows = stmt.query_map(params![vault_id], |r| {
+            let event_types_str: String = r.get(3)?;
+            let created_at_str: String = r.get(4)?;
+            Ok(WebhookSubscription {
+                id: r.get(0)?,
+                vault_id: r.get(1)?,
+                endpoint_url: r.get(2)?,
+                event_types: serde_json::from_str(&event_types_str).unwrap_or_default(),
+                created_at: created_at_str.parse().unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect()
+    }
+
     // ── Idempotency (#825) ──────────────────────────────────────────────────
 
     pub fn store_idempotency(&self, key: &str, status_code: u16, response_body: &str) {
@@ -1128,84 +908,6 @@ impl Db {
             })
         })
         .ok()
-    }
-
-    // ── Unsubscribe (#828) ──────────────────────────────────────────────────
-
-    pub fn store_unsubscribe_token(&self, token: &str, owner: &str) {
-        let _ = self.conn.lock().unwrap().execute(
-            r#"INSERT OR REPLACE INTO unsubscribe_tokens (token, owner, created_at)
-               VALUES (?1, ?2, ?3)"#,
-            params![token, owner, chrono::Utc::now().to_rfc3339()],
-        );
-    }
-
-    pub fn process_unsubscribe(&self, token: &str) -> Result<String, String> {
-        let conn = self.conn.lock().unwrap();
-        let owner: String = conn
-            .query_row(
-                "SELECT owner FROM unsubscribe_tokens WHERE token = ?1",
-                params![token],
-                |r| r.get(0),
-            )
-            .map_err(|_| "invalid or expired unsubscribe token".to_string())?;
-
-        conn.execute(
-            "INSERT OR IGNORE INTO unsubscribed_users (owner) VALUES (?1)",
-            params![&owner],
-        )
-        .map_err(|e| e.to_string())?;
-
-        Ok(owner)
-    }
-
-    pub fn is_unsubscribed(&self, owner: &str) -> bool {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT 1 FROM unsubscribed_users WHERE owner = ?1",
-                params![owner],
-                |_| Ok(()),
-            )
-            .is_ok()
-    }
-
-    pub fn generate_unsubscribe_token(&self, owner: &str) -> String {
-        let token = uuid::Uuid::new_v4().to_string();
-        self.store_unsubscribe_token(&token, owner);
-        token
-    }
-
-    // ── Token-based reminder links (#1286) ──────────────────────────────────
-
-    pub fn store_reminder_token(&self, token: &str, vault_id: &str, owner: &str) {
-        let _ = self.conn.lock().unwrap().execute(
-            r#"INSERT OR REPLACE INTO reminder_tokens (token, vault_id, owner, created_at)
-               VALUES (?1, ?2, ?3, ?4)"#,
-            params![token, vault_id, owner, chrono::Utc::now().to_rfc3339()],
-        );
-    }
-
-    pub fn generate_reminder_token(&self, vault_id: &str, owner: &str) -> String {
-        let token = uuid::Uuid::new_v4().to_string();
-        self.store_reminder_token(&token, vault_id, owner);
-        token
-    }
-
-    pub fn resolve_reminder_token(&self, token: &str) -> Result<(String, String), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT vault_id, owner FROM reminder_tokens WHERE token = ?1",
-            params![token],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|_| "invalid or expired reminder token".to_string())
-    }
-
-    pub fn generate_reminder_url(&self, vault_id: &str, owner: &str, base_url: &str) -> String {
-        let token = self.generate_reminder_token(vault_id, owner);
-        format!("{base_url}/reminders/check-in?token={token}")
     }
 
     // ── Audit Log persistence (#961) ─────────────────────────────────────────
@@ -1410,12 +1112,15 @@ impl Db {
         }
     }
 
-    pub fn revoke_refresh_token(&self, jti: &str) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+    /// Atomically revokes a single refresh token. Returns `false` if it was
+    /// already revoked (e.g. by a concurrent refresh), so callers can treat
+    /// the loser of a rotation race as a reuse.
+    pub fn revoke_refresh_token(&self, jti: &str) -> Result<bool, rusqlite::Error> {
+        let updated = self.conn.lock().unwrap().execute(
             "UPDATE refresh_tokens SET revoked_at = ?1 WHERE jti = ?2 AND revoked_at IS NULL",
             params![chrono::Utc::now().to_rfc3339(), jti],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     /// Revokes every token in a rotation family — used when a refresh token
@@ -1705,168 +1410,6 @@ impl Db {
         Ok(())
     }
 
-    // ── Issue #1337: Beneficiary archival notification ─────────────────────
-
-    /// Persist (create or update) a beneficiary's contact information.
-    /// The `vault_id` + `beneficiary_address` pair is the primary key.
-    pub fn upsert_beneficiary_contact(
-        &self,
-        contact: &crate::models::BeneficiaryContact,
-    ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
-            r#"
-            INSERT INTO beneficiary_contacts
-                (vault_id, beneficiary_address, email, phone, opted_in, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(vault_id, beneficiary_address) DO UPDATE SET
-                email      = excluded.email,
-                phone      = excluded.phone,
-                opted_in   = excluded.opted_in,
-                updated_at = excluded.updated_at
-            "#,
-            params![
-                contact.vault_id,
-                contact.beneficiary_address,
-                contact.email,
-                contact.phone,
-                contact.opted_in as i64,
-                contact.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Retrieve the contact entry for a specific vault + beneficiary pair.
-    pub fn get_beneficiary_contact(
-        &self,
-        vault_id: &str,
-        beneficiary_address: &str,
-    ) -> Result<Option<crate::models::BeneficiaryContact>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r#"
-            SELECT vault_id, beneficiary_address, email, phone, opted_in, updated_at
-            FROM beneficiary_contacts
-            WHERE vault_id = ?1 AND beneficiary_address = ?2
-            "#,
-        )?;
-
-        let row_res = stmt.query_row(params![vault_id, beneficiary_address], |r| {
-            let updated_at_str: String = r.get(5)?;
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        5,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-            let opted_in_i: i64 = r.get(4)?;
-            Ok(crate::models::BeneficiaryContact {
-                vault_id: r.get(0)?,
-                beneficiary_address: r.get(1)?,
-                email: r.get(2)?,
-                phone: r.get(3)?,
-                opted_in: opted_in_i != 0,
-                updated_at,
-            })
-        });
-
-        match row_res {
-            Ok(c) => Ok(Some(c)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Retrieve all opted-in beneficiary contacts for a given vault.
-    pub fn get_opted_in_contacts_for_vault(
-        &self,
-        vault_id: &str,
-    ) -> Result<Vec<crate::models::BeneficiaryContact>, rusqlite::Error> {
-        let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            r#"
-            SELECT vault_id, beneficiary_address, email, phone, opted_in, updated_at
-            FROM beneficiary_contacts
-            WHERE vault_id = ?1 AND opted_in = 1
-            "#,
-        )?;
-
-        let iter = stmt.query_map(params![vault_id], |r| {
-            let updated_at_str: String = r.get(5)?;
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        5,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-            let opted_in_i: i64 = r.get(4)?;
-            Ok(crate::models::BeneficiaryContact {
-                vault_id: r.get(0)?,
-                beneficiary_address: r.get(1)?,
-                email: r.get(2)?,
-                phone: r.get(3)?,
-                opted_in: opted_in_i != 0,
-                updated_at,
-            })
-        })?;
-
-        let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
-        }
-        Ok(out)
-    }
-
-    /// Update only the `opted_in` flag for a beneficiary contact.
-    pub fn set_beneficiary_notification_opt_in(
-        &self,
-        vault_id: &str,
-        beneficiary_address: &str,
-        opted_in: bool,
-    ) -> Result<(), rusqlite::Error> {
-        let now = chrono::Utc::now().to_rfc3339();
-        self.conn.lock().unwrap().execute(
-            r#"
-            UPDATE beneficiary_contacts
-            SET opted_in = ?1, updated_at = ?2
-            WHERE vault_id = ?3 AND beneficiary_address = ?4
-            "#,
-            params![opted_in as i64, now, vault_id, beneficiary_address],
-        )?;
-        Ok(())
-    }
-
-    /// Record a dispatched archival notification for audit purposes.
-    pub fn record_beneficiary_archival_notification(
-        &self,
-        notif: &crate::models::BeneficiaryArchivalNotification,
-    ) -> Result<(), rusqlite::Error> {
-        let status = format!("{:?}", notif.status).to_lowercase();
-        self.conn.lock().unwrap().execute(
-            r#"
-            INSERT OR REPLACE INTO beneficiary_archival_notifications
-                (id, vault_id, beneficiary_address, channel, dispatched_at, status, error)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            params![
-                notif.id,
-                notif.vault_id,
-                notif.beneficiary_address,
-                notif.channel,
-                notif.dispatched_at.to_rfc3339(),
-                status,
-                notif.error,
-            ],
-        )?;
-        Ok(())
-    }
-
     // ── Issue #1594: Escalation tier transitions ────────────────────────────
 
     pub fn get_escalation_state(
@@ -2114,67 +1657,4 @@ mod tests {
         assert_eq!(result3.vaults.len(), 5);
         assert!(result3.next_cursor.is_none());
     }
-}
-
-// ── Cache-aware vault accessors ───────────────────────────────────────────────
-
-use crate::cache::VaultCache;
-use crate::models::VaultSummary;
-
-/// Retrieve a `Vault` from the in-memory store, consulting the cache first.
-///
-/// On a cache miss the vault is fetched from `store`, inserted into the cache
-/// and then returned. Returns `None` if the vault does not exist in the store.
-pub fn get_vault_cached(
-    store: &VaultStore,
-    cache: &VaultCache,
-    vault_id: &str,
-) -> Option<crate::models::Vault> {
-    if let Some(v) = cache.get_vault(vault_id) {
-        return Some(v);
-    }
-    let vault = store.lock().unwrap().get(vault_id).cloned()?;
-    cache.set_vault(vault_id, vault.clone());
-    Some(vault)
-}
-
-/// Retrieve the TTL-remaining value for a vault, consulting the cache first.
-///
-/// Returns `None` if the vault does not exist in the store.
-pub fn get_ttl_remaining_cached(
-    store: &VaultStore,
-    cache: &VaultCache,
-    vault_id: &str,
-) -> Option<Option<u64>> {
-    if let Some(ttl) = cache.get_ttl_remaining(vault_id) {
-        return Some(ttl);
-    }
-    let vault = store.lock().unwrap().get(vault_id).cloned()?;
-    let ttl = vault.ttl_remaining;
-    cache.set_ttl_remaining(vault_id, ttl);
-    Some(ttl)
-}
-
-/// Retrieve a lightweight `VaultSummary` for a vault, consulting the cache
-/// first.
-///
-/// Returns `None` if the vault does not exist in the store.
-pub fn get_vault_summary_cached(
-    store: &VaultStore,
-    cache: &VaultCache,
-    vault_id: &str,
-) -> Option<VaultSummary> {
-    if let Some(s) = cache.get_vault_summary(vault_id) {
-        return Some(s);
-    }
-    let vault = store.lock().unwrap().get(vault_id).cloned()?;
-    let summary = VaultSummary::from(&vault);
-    cache.set_vault_summary(vault_id, summary.clone());
-    Some(summary)
-}
-
-/// Invalidate all cached entries for `vault_id`.  Must be called whenever
-/// a check-in or state-change event modifies vault state.
-pub fn invalidate_vault_cache(cache: &VaultCache, vault_id: &str) {
-    cache.invalidate(vault_id);
 }
