@@ -48,3 +48,44 @@ export interface DeviceToken {
 export interface CsrfTokenResponse {
   csrf_token: string;
 }
+
+export type UpgradeProposalStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "executed"
+  | "expired";
+
+export interface UpgradeProposal {
+  id: string;
+  proposed_wasm_hash: string;
+  proposer: string;
+  timelock_until: string;
+  eta: string;
+  approvals: string[];
+  status: UpgradeProposalStatus;
+  created_at: string;
+}
+
+export interface UpgradeProposalListResponse {
+  proposals: UpgradeProposal[];
+}
+
+export interface ApproveUpgradeProposalRequest {
+  proposal_id: string;
+  approver: string;
+}
+
+export interface RejectUpgradeProposalRequest {
+  proposal_id: string;
+  rejector: string;
+  reason?: string;
+}
+
+export interface UpgradeProposalActionResponse {
+  proposal: UpgradeProposal;
+}
+
+export interface AdminAddressResponse {
+  admin_address: string;
+}
