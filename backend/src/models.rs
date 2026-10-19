@@ -242,6 +242,10 @@ pub struct ScheduledNotification {
     pub status: DeliveryStatus,
     pub max_retry_attempts: u32,
     pub sent_at: Option<DateTime<Utc>>,
+    /// Hours left on the vault TTL, quoted in `ExpiryWarning` bodies.
+    /// `None` falls back to a generic 24h figure.
+    #[serde(default)]
+    pub ttl_hours: Option<u64>,
 }
 
 /// Delivery record written after each send attempt.
@@ -1152,6 +1156,17 @@ pub struct WebhookDelivery {
     pub next_retry_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub attempts: Vec<WebhookAttempt>,
+}
+
+/// Owner-registered endpoint for vault events. An empty `event_types` list
+/// subscribes to every event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookSubscription {
+    pub id: String,
+    pub vault_id: String,
+    pub endpoint_url: String,
+    pub event_types: Vec<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 // ── Two-factor authentication (2FA) ─────────────────────────────────────────

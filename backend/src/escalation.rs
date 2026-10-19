@@ -238,8 +238,52 @@ async fn send_escalation_notifications(
         }
     }
 
+    if !send_slack_alert(vault_id, tier).await {
+        all_delivered = false;
+    }
+
     let _ = channels;
     all_delivered
+}
+
+/// Post the escalation to the Slack incoming webhook configured via
+/// `SLACK_WEBHOOK_URL`. Returns true when delivered or when Slack is not configured.
+async fn send_slack_alert(vault_id: u64, tier: EscalationTier) -> bool {
+    let Ok(url) = std::env::var("SLACK_WEBHOOK_URL") else {
+        return true;
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "text": format!("Vault {vault_id} requires attention: escalation tier {tier:?} triggered."),
+    });
+
+    match client.post(&url).json(&payload).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(vault_id, ?tier, "escalation: slack notification delivered");
+            true
+        }
+        Ok(resp) => {
+            tracing::error!(
+                vault_id,
+                ?tier,
+                status = %resp.status(),
+                "escalation: slack notification rejected"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                vault_id,
+                ?tier,
+                error = %e,
+                "escalation: slack notification failed"
+            );
+            false
+        }
+    }
 }
 
 /// Return hours remaining until TTL expiry for a vault, derived from the real

@@ -16,6 +16,7 @@ mod openapi_contract {
         let mut m = HashMap::new();
         m.insert("vault_id", "test-vault-1");
         m.insert("id", "test-vault-1");
+        m.insert("beneficiary_id", "test-beneficiary-1");
         m
     }
 
@@ -50,6 +51,21 @@ mod openapi_contract {
         ("GET", "/api/vaults/{vault_id}/sponsored-release"),
         ("POST", "/api/vaults/{vault_id}/vesting/claim-bonus"),
         ("GET", "/api/vaults/{vault_id}/vesting/bonus"),
+        // Beneficiary endpoints
+        ("POST", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/accept"),
+        ("POST", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/decline"),
+        ("GET", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/conflict"),
+        ("POST", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/auction"),
+        ("GET", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/waterfall"),
+    ];
+
+    /// Beneficiary route templates that must be covered by contract tests.
+    const BENEFICIARY_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/accept"),
+        ("POST", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/decline"),
+        ("GET", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/conflict"),
+        ("POST", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/auction"),
+        ("GET", "/api/vaults/{vault_id}/beneficiaries/{beneficiary_id}/waterfall"),
     ];
 
     /// Checks that a route returns something other than 404.
@@ -147,6 +163,43 @@ mod openapi_contract {
             ROUTES.len(),
             "Each route should be unique in ROUTES table"
         );
+    }
+
+    #[test]
+    fn beneficiary_routes_defined_in_spec_and_resolvable() {
+        let openapi_content = std::fs::read_to_string("docs/openapi.yaml")
+            .expect("Failed to read docs/openapi.yaml");
+
+        let params = path_param_defaults();
+
+        for (method, template) in BENEFICIARY_ROUTES {
+            // Each beneficiary route must be present in the ROUTES table.
+            assert!(
+                ROUTES.iter().any(|(m, p)| m == method && p == template),
+                "Beneficiary route {} {} must be listed in ROUTES",
+                method,
+                template
+            );
+
+            // Each beneficiary route must be defined in the OpenAPI spec.
+            assert!(
+                openapi_content.contains(template),
+                "Beneficiary route {} {} must be defined in docs/openapi.yaml",
+                method,
+                template
+            );
+
+            // Each beneficiary route must resolve without unresolved placeholders.
+            let resolved = resolve_path(template, &params);
+            assert!(
+                !resolved.contains('{'),
+                "Unresolved path parameter in beneficiary route {} {}: {}",
+                method,
+                template,
+                resolved
+            );
+            println!("✅  {} {}", method, resolved);
+        }
     }
 
     #[test]

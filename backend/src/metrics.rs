@@ -1,9 +1,60 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Default check-in latency histogram bucket boundaries, in milliseconds.
+pub const DEFAULT_CHECKIN_LATENCY_BUCKETS_MS: [u64; 6] = [10, 50, 100, 500, 1000, 5000];
+
+/// Environment variable used to override the check-in latency buckets.
+pub const CHECKIN_LATENCY_BUCKETS_ENV: &str = "CHECKIN_LATENCY_BUCKETS_MS";
+
+/// Parse a comma-separated list of bucket boundaries (in milliseconds).
+///
+/// Returns `None` when the input is empty, contains a non-numeric entry, or is
+/// not strictly increasing (Prometheus requires ascending bucket boundaries).
+pub fn parse_checkin_latency_buckets(raw: &str) -> Option<Vec<u64>> {
+    let mut buckets = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let value: u64 = trimmed.parse().ok()?;
+        if let Some(&prev) = buckets.last() {
+            if value <= prev {
+                return None;
+            }
+        }
+        buckets.push(value);
+    }
+    if buckets.is_empty() {
+        None
+    } else {
+        Some(buckets)
+    }
+}
+
+/// Resolve the check-in latency buckets from the environment, falling back to
+/// the defaults when the variable is unset or invalid.
+pub fn checkin_latency_buckets_from_env() -> Vec<u64> {
+    match std::env::var(CHECKIN_LATENCY_BUCKETS_ENV) {
+        Ok(raw) => parse_checkin_latency_buckets(&raw).unwrap_or_else(|| {
+            eprintln!(
+                "warning: invalid {CHECKIN_LATENCY_BUCKETS_ENV}={raw:?}, using defaults"
+            );
+            DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec()
+        }),
+        Err(_) => DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec(),
+    }
+}
+
 /// Shared metrics state for the TTL-Legacy backend.
-#[derive(Default)]
 pub struct Metrics {
+    /// Check-in latency histogram bucket boundaries in milliseconds (ascending).
+    pub checkin_latency_buckets_ms: Vec<u64>,
+    /// Per-bucket cumulative counts for check-in latency observations.
+    pub checkin_latency_bucket_counts: Vec<AtomicU64>,
+    pub checkin_latency_ms_sum: AtomicU64,
+    pub checkin_latency_ms_count: AtomicU64,
     pub vaults_total: AtomicU64,
     pub checkins_total: AtomicU64,
     pub releases_total: AtomicU64,
@@ -23,9 +74,94 @@ pub struct Metrics {
     pub notification_delivery_latency_ms_count: AtomicU64,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::with_checkin_latency_buckets(DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec())
+    }
+}
+
 impl Metrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Build metrics with explicit check-in latency bucket boundaries.
+    ///
+    /// The provided buckets are sorted and de-duplicated; if the result is
+    /// empty the defaults are used.
+    pub fn with_checkin_latency_buckets(mut buckets: Vec<u64>) -> Self {
+        buckets.sort_unstable();
+        buckets.dedup();
+        if buckets.is_empty() {
+            buckets = DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec();
+        }
+        let bucket_counts = buckets.iter().map(|_| AtomicU64::new(0)).collect();
+        Self {
+            checkin_latency_buckets_ms: buckets,
+            checkin_latency_bucket_counts: bucket_counts,
+            checkin_latency_ms_sum: AtomicU64::new(0),
+            checkin_latency_ms_count: AtomicU64::new(0),
+            ..Self::empty()
+        }
+    }
+
+    /// Build metrics using buckets resolved from the environment.
+    pub fn from_env() -> Arc<Self> {
+        Arc::new(Self::with_checkin_latency_buckets(
+            checkin_latency_buckets_from_env(),
+        ))
+    }
+
+    /// A `Metrics` value with all counters zeroed and default buckets.
+    fn empty() -> Self {
+        let buckets = DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec();
+        let bucket_counts = buckets.iter().map(|_| AtomicU64::new(0)).collect();
+        Self {
+            checkin_latency_buckets_ms: buckets,
+            checkin_latency_bucket_counts: bucket_counts,
+            checkin_latency_ms_sum: AtomicU64::new(0),
+            checkin_latency_ms_count: AtomicU64::new(0),
+            vaults_total: AtomicU64::new(0),
+            checkins_total: AtomicU64::new(0),
+            releases_total: AtomicU64::new(0),
+            active_vaults: AtomicI64::new(0),
+            request_errors_total: AtomicU64::new(0),
+            http_requests_total: AtomicU64::new(0),
+            contract_paused: AtomicU64::new(0),
+            notification_deliveries_total: AtomicU64::new(0),
+            notification_delivery_failures_total: AtomicU64::new(0),
+            notification_push_success_total: AtomicU64::new(0),
+            notification_push_failure_total: AtomicU64::new(0),
+            notification_email_success_total: AtomicU64::new(0),
+            notification_email_failure_total: AtomicU64::new(0),
+            notification_sms_success_total: AtomicU64::new(0),
+            notification_sms_failure_total: AtomicU64::new(0),
+            notification_delivery_latency_ms_sum: AtomicU64::new(0),
+            notification_delivery_latency_ms_count: AtomicU64::new(0),
+            notification_push_latency_ms_sum: AtomicU64::new(0),
+            notification_push_latency_ms_count: AtomicU64::new(0),
+            notification_email_latency_ms_sum: AtomicU64::new(0),
+            notification_email_latency_ms_count: AtomicU64::new(0),
+            notification_sms_latency_ms_sum: AtomicU64::new(0),
+            notification_sms_latency_ms_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a check-in latency observation (in milliseconds).
+    pub fn record_checkin_latency(&self, latency_ms: u64) {
+        self.checkin_latency_ms_sum
+            .fetch_add(latency_ms, Ordering::Relaxed);
+        self.checkin_latency_ms_count
+            .fetch_add(1, Ordering::Relaxed);
+        for (bound, counter) in self
+            .checkin_latency_buckets_ms
+            .iter()
+            .zip(self.checkin_latency_bucket_counts.iter())
+        {
+            if latency_ms <= *bound {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Record a successful notification delivery for the given channel.
@@ -186,6 +322,15 @@ impl Metrics {
             "Total failed SMS notification deliveries",
             self.notification_sms_failure_total.load(Ordering::Relaxed),
         );
+        push_bucketed_histogram(
+            &mut out,
+            "ttl_legacy_checkin_latency_ms",
+            "Check-in latency in milliseconds",
+            &self.checkin_latency_buckets_ms,
+            &self.checkin_latency_bucket_counts,
+            self.checkin_latency_ms_sum.load(Ordering::Relaxed),
+            self.checkin_latency_ms_count.load(Ordering::Relaxed),
+        );
         push_histogram(
             &mut out,
             "ttl_legacy_notification_delivery_latency_ms",
@@ -240,6 +385,26 @@ fn push_gauge_i64(out: &mut String, name: &str, help: &str, value: i64) {
 fn push_histogram(out: &mut String, name: &str, help: &str, sum: u64, count: u64) {
     out.push_str(&format!("# HELP {name} {help}\n"));
     out.push_str(&format!("# TYPE {name} histogram\n"));
+    out.push_str(&format!("{name}_sum {sum}\n"));
+    out.push_str(&format!("{name}_count {count}\n"));
+}
+
+fn push_bucketed_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    bounds: &[u64],
+    counts: &[AtomicU64],
+    sum: u64,
+    count: u64,
+) {
+    out.push_str(&format!("# HELP {name} {help}\n"));
+    out.push_str(&format!("# TYPE {name} histogram\n"));
+    for (bound, counter) in bounds.iter().zip(counts.iter()) {
+        let value = counter.load(Ordering::Relaxed);
+        out.push_str(&format!("{name}_bucket{{le=\"{bound}\"}} {value}\n"));
+    }
+    out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {count}\n"));
     out.push_str(&format!("{name}_sum {sum}\n"));
     out.push_str(&format!("{name}_count {count}\n"));
 }
@@ -303,6 +468,73 @@ mod tests {
         assert!(output.contains("ttl_legacy_notification_email_failure_total 0"));
         assert!(output.contains("ttl_legacy_notification_sms_success_total 0"));
         assert!(output.contains("ttl_legacy_notification_sms_failure_total 1"));
+    }
+
+    #[test]
+    fn test_parse_checkin_latency_buckets_valid() {
+        assert_eq!(
+            parse_checkin_latency_buckets("10,50,100,500,1000,5000"),
+            Some(vec![10, 50, 100, 500, 1000, 5000])
+        );
+        assert_eq!(
+            parse_checkin_latency_buckets(" 5 , 25 ,100 "),
+            Some(vec![5, 25, 100])
+        );
+    }
+
+    #[test]
+    fn test_parse_checkin_latency_buckets_invalid() {
+        assert_eq!(parse_checkin_latency_buckets(""), None);
+        assert_eq!(parse_checkin_latency_buckets("10,,50"), None);
+        assert_eq!(parse_checkin_latency_buckets("10,abc,50"), None);
+        assert_eq!(parse_checkin_latency_buckets("-10,50"), None);
+        // Not strictly increasing.
+        assert_eq!(parse_checkin_latency_buckets("100,50"), None);
+        assert_eq!(parse_checkin_latency_buckets("50,50"), None);
+    }
+
+    #[test]
+    fn test_checkin_latency_buckets_fallback_to_defaults() {
+        // Invalid input falls back to the defaults.
+        let buckets = parse_checkin_latency_buckets("not,a,list")
+            .unwrap_or_else(|| DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec());
+        assert_eq!(buckets, DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec());
+
+        // Empty bucket list also falls back to defaults.
+        let m = Metrics::with_checkin_latency_buckets(Vec::new());
+        assert_eq!(
+            m.checkin_latency_buckets_ms,
+            DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec()
+        );
+    }
+
+    #[test]
+    fn test_checkin_latency_histogram_uses_configured_buckets() {
+        let m = Metrics::with_checkin_latency_buckets(vec![100, 200, 300]);
+        m.record_checkin_latency(50);
+        m.record_checkin_latency(150);
+        m.record_checkin_latency(1000);
+
+        let output = m.render();
+        assert!(output.contains("# TYPE ttl_legacy_checkin_latency_ms histogram"));
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_bucket{le=\"100\"} 1"));
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_bucket{le=\"200\"} 2"));
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_bucket{le=\"300\"} 2"));
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_bucket{le=\"+Inf\"} 3"));
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_sum 1200"));
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_count 3"));
+    }
+
+    #[test]
+    fn test_checkin_latency_default_buckets() {
+        let m = Metrics::new();
+        assert_eq!(
+            m.checkin_latency_buckets_ms,
+            DEFAULT_CHECKIN_LATENCY_BUCKETS_MS.to_vec()
+        );
+        let output = m.render();
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_bucket{le=\"10\"} 0"));
+        assert!(output.contains("ttl_legacy_checkin_latency_ms_bucket{le=\"5000\"} 0"));
     }
 
     #[test]

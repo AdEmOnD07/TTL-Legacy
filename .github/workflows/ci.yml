@@ -31,9 +31,10 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+            ~/.cargo/bin/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ci-
 
       - name: Build contracts
         run: cargo build --workspace
@@ -54,21 +55,37 @@ jobs:
           fi
           echo "WASM size: $(( SIZE / 1024 )) KB (threshold: 256 KB)"
 
+          ZK_SIZE=$(stat -c%s target/wasm32-unknown-unknown/release/zk_verifier.wasm)
+          ZK_THRESHOLD=$((256 * 1024))
+          if [ "$ZK_SIZE" -gt "$ZK_THRESHOLD" ]; then
+            echo "zk_verifier WASM size exceeds threshold by $(( (ZK_SIZE - ZK_THRESHOLD) / 1024 )) KB"
+            echo "zk_verifier WASM size: $(( ZK_SIZE / 1024 )) KB (threshold: 256 KB)"
+            exit 1
+          fi
+          echo "zk_verifier WASM size: $(( ZK_SIZE / 1024 )) KB (threshold: 256 KB)"
+
       - name: Comment WASM size on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
             const fs = require('fs');
-            const path = 'target/wasm32-unknown-unknown/release/ttl_vault.wasm';
-            if (fs.existsSync(path)) {
-              const size = fs.statSync(path).size;
-              const kb = (size / 1024).toFixed(2);
+            const thresholdKb = 256;
+            const report = (label, path) => {
+              if (!fs.existsSync(path)) return null;
+              const kb = (fs.statSync(path).size / 1024).toFixed(2);
+              return `- **${label}**: ${kb} KB (threshold: ${thresholdKb} KB)`;
+            };
+            const lines = [
+              report('ttl_vault', 'target/wasm32-unknown-unknown/release/ttl_vault.wasm'),
+              report('zk_verifier', 'target/wasm32-unknown-unknown/release/zk_verifier.wasm'),
+            ].filter(Boolean);
+            if (lines.length > 0) {
               github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: `📦 **WASM Size Report**: ${kb} KB (threshold: 256 KB)`
+                body: `📦 **WASM Size Report**\n${lines.join('\n')}`
               });
             }
 
@@ -173,9 +190,10 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+            ~/.cargo/bin/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-coverage-
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked

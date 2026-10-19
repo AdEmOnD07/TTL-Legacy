@@ -66,6 +66,8 @@ pub enum AppError {
     RpcUnavailable,
     #[error("email delivery failed: {0}")]
     EmailDelivery(String),
+    #[error("sponsor account has insufficient balance: {0}")]
+    SponsorInsufficientBalance(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -83,6 +85,9 @@ impl IntoResponse for AppError {
             AppError::Rpc(_) => (StatusCode::BAD_GATEWAY, "rpc_error"),
             AppError::RpcUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "rpc_unavailable"),
             AppError::EmailDelivery(_) => (StatusCode::BAD_GATEWAY, "email_delivery_failed"),
+            AppError::SponsorInsufficientBalance(_) => {
+                (StatusCode::PAYMENT_REQUIRED, "sponsor_insufficient_balance")
+            }
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         ApiError::new(status, code, self.to_string()).into_response()
@@ -123,6 +128,13 @@ mod tests {
     fn not_found_maps_to_404() {
         let response = AppError::NotFound.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn sponsor_insufficient_balance_maps_to_402() {
+        let err = AppError::SponsorInsufficientBalance("balance below fee".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     }
 
     #[test]

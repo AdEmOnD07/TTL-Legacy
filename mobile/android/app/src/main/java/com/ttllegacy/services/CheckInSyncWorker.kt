@@ -19,8 +19,12 @@ class CheckInSyncWorker @AssistedInject constructor(
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
+        // Drain the queue FIFO (oldest first) so check-ins are submitted in order.
         val pending = dao.getAll()
-        if (pending.isEmpty()) return Result.success()
+        if (pending.isEmpty()) {
+            notificationHelper.cancelQueuedCheckIn()
+            return Result.success()
+        }
 
         // Warn about items that may have already expired before we can submit them.
         val nowMillis = System.currentTimeMillis()
@@ -33,12 +37,16 @@ class CheckInSyncWorker @AssistedInject constructor(
 
         var hasNetworkFailure = false
         for (item in pending) {
-            when (val result = apiClient.checkIn(item.vaultId)) {
+            when (val result = apiClient.checkIn(item.vaultId, item.signedPayload)) {
                 is ApiResult.Success -> {
                     dao.delete(item)
                     notificationHelper.notifyCheckInSyncSuccess(item.vaultId)
                 }
-                ApiResult.NetworkUnavailable -> hasNetworkFailure = true
+                ApiResult.NetworkUnavailable -> {
+                    // Stop draining; keep remaining items queued and retry later.
+                    hasNetworkFailure = true
+                    break
+                }
                 is ApiResult.Error -> {
                     // Remove from queue even on error — prevent infinite retry loops.
                     // The server-side response will reflect the true vault state.
@@ -57,8 +65,8 @@ class CheckInSyncWorker @AssistedInject constructor(
     companion object {
         const val WORK_NAME = "checkin_sync"
 
-        fun schedule(context: Context) {
-            val request = OneTimeWorkRequestBuilder<CheckInSyncWorker>()
+        fun buildWorkRequest(): OneTimeWorkRequest =
+            OneTimeWorkRequestBuilder<CheckInSyncWorker>()
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -66,10 +74,12 @@ class CheckInSyncWorker @AssistedInject constructor(
                 )
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
+
+        fun schedule(context: Context) {
             WorkManager.getInstance(context).enqueueUniqueWork(
                 WORK_NAME,
                 ExistingWorkPolicy.KEEP,
-                request
+                buildWorkRequest()
             )
         }
     }

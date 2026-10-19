@@ -46,6 +46,10 @@ pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> Resp
     );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
 
     response
 }
@@ -88,6 +92,10 @@ mod tests {
         assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
         assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+        assert_eq!(
+            headers.get("permissions-policy").unwrap(),
+            "camera=(), microphone=(), geolocation=()"
+        );
     }
 
     #[tokio::test]
@@ -215,6 +223,23 @@ mod tests {
         assert_eq!(
             response.headers().get("x-frame-options").unwrap(),
             "DENY"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissions_policy_header_present_on_every_response() {
+        std::env::remove_var("CSP_POLICY");
+        let app = test_app();
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(response.headers().contains_key("permissions-policy"));
+        assert_eq!(
+            response.headers().get("permissions-policy").unwrap(),
+            "camera=(), microphone=(), geolocation=()"
         );
     }
 
