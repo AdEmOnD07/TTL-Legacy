@@ -2,7 +2,7 @@ use crate::models::{
     AuditEntry, AuditLogEntry, AuditLogQuery, Channel, Frequency, Passkey, RecoveryCode,
     RecoveryCodeSet, ReminderPreferences, SearchQuery, SearchResult, Subscription,
     SubscriptionChannel, SubscriptionFrequency, Vault, VaultBackup, VaultEvent,
-    VaultNotificationPreferences, VaultShare, VaultStatus,
+    VaultNotificationPreferences, VaultShare, VaultStatus, WebhookSubscription,
 };
 
 use chrono::Utc;
@@ -602,6 +602,267 @@ impl Db {
         Ok(())
     }
 
+    pub fn upsert(&self, prefs: &ReminderPreferences) -> Result<(), rusqlite::Error> {
+        let channels_json = serde_json::to_string(&prefs.channels).unwrap();
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO reminder_preferences (vault_id, channels, hours_before_expiry, frequency)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              channels = excluded.channels,
+              hours_before_expiry = excluded.hours_before_expiry,
+              frequency = excluded.frequency,
+              deleted_at = NULL
+            "#,
+            params![
+                prefs.vault_id as i64,
+                channels_json,
+                prefs.hours_before_expiry as i64,
+                serde_json::to_string(&prefs.frequency).unwrap(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get(&self, vault_id: u64) -> Result<ReminderPreferences, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+               FROM reminder_preferences
+               WHERE vault_id = ?1 AND deleted_at IS NULL"#,
+        )?;
+        let row = stmt.query_row(params![vault_id as i64], |r| {
+            let channels_str: String = r.get(1)?;
+            let frequency_str: String = r.get(3)?;
+            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+            Ok(ReminderPreferences {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                channels,
+                hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                frequency,
+                deleted_at: None,
+            })
+        })?;
+        Ok(row)
+    }
+
+    pub fn all(&self) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+               FROM reminder_preferences
+               WHERE deleted_at IS NULL"#,
+        )?;
+        let iter = stmt.query_map([], |r| {
+            let channels_str: String = r.get(1)?;
+            let frequency_str: String = r.get(3)?;
+            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+            Ok(ReminderPreferences {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                channels,
+                hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                frequency,
+                deleted_at: None,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    pub fn soft_delete_reminder(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE reminder_preferences SET deleted_at = ?1 WHERE vault_id = ?2 AND deleted_at IS NULL",
+            params![chrono::Utc::now().to_rfc3339(), vault_id as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn all_reminders_including_deleted(
+        &self,
+        vault_id: u64,
+    ) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"SELECT vault_id, channels, hours_before_expiry, frequency, deleted_at
+               FROM reminder_preferences
+               WHERE vault_id = ?1"#,
+        )?;
+        let iter = stmt.query_map(params![vault_id as i64], |r| {
+            let channels_str: String = r.get(1)?;
+            let frequency_str: String = r.get(3)?;
+            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+            let deleted_at_str: Option<String> = r.get(4)?;
+            let deleted_at = deleted_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            Ok(ReminderPreferences {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                channels,
+                hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                frequency,
+                deleted_at,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_subscription(&self, sub: &Subscription) -> Result<(), rusqlite::Error> {
+        let channels_json = serde_json::to_string(&sub.channels).unwrap();
+        let frequency_json = serde_json::to_string(&sub.frequency).unwrap();
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO vault_subscriptions (vault_id, owner, channels, frequency)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              owner = excluded.owner,
+              channels = excluded.channels,
+              frequency = excluded.frequency
+            "#,
+            params![
+                sub.vault_id as i64,
+                sub.owner,
+                channels_json,
+                frequency_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_subscription(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM vault_subscriptions WHERE vault_id = ?1",
+            params![vault_id as i64],
+        )?;
+        Ok(())
+    }
+
+    // ── Withdrawal alert preferences ─────────────────────────────────────────
+
+    /// Upsert per-vault withdrawal alert notification preferences.
+    pub fn upsert_withdrawal_alert_prefs(
+        &self,
+        prefs: &crate::models::WithdrawalAlertPreferences,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO withdrawal_alert_preferences (vault_id, owner, email_enabled, push_enabled)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(vault_id) DO UPDATE SET
+                owner         = excluded.owner,
+                email_enabled = excluded.email_enabled,
+                push_enabled  = excluded.push_enabled
+            "#,
+            params![
+                prefs.vault_id as i64,
+                prefs.owner,
+                prefs.email_enabled as i64,
+                prefs.push_enabled as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve withdrawal alert preferences for a vault.
+    /// Returns `None` if no record exists (owner has never configured prefs).
+    pub fn get_withdrawal_alert_prefs(
+        &self,
+        vault_id: u64,
+    ) -> Result<Option<crate::models::WithdrawalAlertPreferences>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"SELECT vault_id, owner, email_enabled, push_enabled
+               FROM withdrawal_alert_preferences
+               WHERE vault_id = ?1"#,
+        )?;
+        let row = stmt.query_row(params![vault_id as i64], |r| {
+            Ok(crate::models::WithdrawalAlertPreferences {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                owner: r.get(1)?,
+                email_enabled: r.get::<_, i64>(2)? != 0,
+                push_enabled: r.get::<_, i64>(3)? != 0,
+            })
+        });
+        match row {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Delete withdrawal alert preferences for a vault.
+    pub fn delete_withdrawal_alert_prefs(&self, vault_id: u64) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM withdrawal_alert_preferences WHERE vault_id = ?1",
+            params![vault_id as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_subscription(&self, vault_id: u64) -> Result<Option<Subscription>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"SELECT vault_id, owner, channels, frequency
+               FROM vault_subscriptions
+               WHERE vault_id = ?1"#,
+        )?;
+        let row = stmt.query_row(params![vault_id as i64], |r| {
+            let channels_str: String = r.get(2)?;
+            let frequency_str: String = r.get(3)?;
+            let channels: Vec<SubscriptionChannel> =
+                serde_json::from_str(&channels_str).unwrap_or_default();
+            let frequency: SubscriptionFrequency = serde_json::from_str(&frequency_str).unwrap();
+            Ok(Subscription {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                owner: r.get(1)?,
+                channels,
+                frequency,
+            })
+        });
+        match row {
+            Ok(sub) => Ok(Some(sub)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn get_webhook_subscriptions_for_vault(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<WebhookSubscription>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"SELECT id, vault_id, endpoint_url, event_types, created_at
+               FROM webhook_subscriptions
+               WHERE vault_id = ?1"#,
+        )?;
+        let rows = stmt.query_map(params![vault_id], |r| {
+            let event_types_str: String = r.get(3)?;
+            let created_at_str: String = r.get(4)?;
+            Ok(WebhookSubscription {
+                id: r.get(0)?,
+                vault_id: r.get(1)?,
+                endpoint_url: r.get(2)?,
+                event_types: serde_json::from_str(&event_types_str).unwrap_or_default(),
+                created_at: created_at_str.parse().unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect()
+    }
+
     // ── Idempotency (#825) ──────────────────────────────────────────────────
 
     pub fn store_idempotency(&self, key: &str, status_code: u16, response_body: &str) {
@@ -802,6 +1063,75 @@ impl Db {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    // ── Refresh token rotation (Issue #1177) ─────────────────────────────────
+
+    pub fn insert_refresh_token(
+        &self,
+        jti: &str,
+        family_id: &str,
+        sub: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r#"INSERT INTO refresh_tokens (jti, family_id, sub, created_at, expires_at, revoked_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, NULL)"#,
+            params![
+                jti,
+                family_id,
+                sub,
+                chrono::Utc::now().to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns (family_id, sub, revoked) for a refresh token, or None if it
+    /// was never issued (unknown / already garbage-collected).
+    pub fn get_refresh_token(
+        &self,
+        jti: &str,
+    ) -> Result<Option<(String, String, bool)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT family_id, sub, revoked_at FROM refresh_tokens WHERE jti = ?1")?;
+        let row = stmt.query_row(params![jti], |r| {
+            let revoked_at: Option<String> = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                revoked_at.is_some(),
+            ))
+        });
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Atomically revokes a single refresh token. Returns `false` if it was
+    /// already revoked (e.g. by a concurrent refresh), so callers can treat
+    /// the loser of a rotation race as a reuse.
+    pub fn revoke_refresh_token(&self, jti: &str) -> Result<bool, rusqlite::Error> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE refresh_tokens SET revoked_at = ?1 WHERE jti = ?2 AND revoked_at IS NULL",
+            params![chrono::Utc::now().to_rfc3339(), jti],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Revokes every token in a rotation family — used when a refresh token
+    /// that was already rotated out gets presented again, which indicates
+    /// the token may have been stolen and replayed.
+    pub fn revoke_refresh_token_family(&self, family_id: &str) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE refresh_tokens SET revoked_at = ?1 WHERE family_id = ?2 AND revoked_at IS NULL",
+            params![chrono::Utc::now().to_rfc3339(), family_id],
+        )?;
+        Ok(())
     }
 
     // ── Sponsored Release tracking (#1122) ───────────────────────────────────
