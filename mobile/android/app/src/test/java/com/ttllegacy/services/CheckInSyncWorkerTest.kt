@@ -3,10 +3,14 @@ package com.ttllegacy.services
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.ListenableWorker
+import androidx.work.NetworkType
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.ttllegacy.api.ApiClient
 import com.ttllegacy.api.ApiResult
+import com.ttllegacy.data.PendingCheckIn
+import com.ttllegacy.data.PendingCheckInDao
+import com.ttllegacy.notifications.NotificationHelper
 import kotlinx.coroutines.runBlocking
 import org.junit.Before
 import org.junit.Test
@@ -14,6 +18,7 @@ import org.junit.runner.RunWith
 import org.mockito.Mock
 import org.mockito.MockitoAnnotations
 import org.mockito.kotlin.any
+import org.mockito.kotlin.never
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 import org.robolectric.RobolectricTestRunner
@@ -40,9 +45,19 @@ class CheckInSyncWorkerTest {
         WorkManagerTestInitHelper.initializeTestWorkManager(context)
     }
 
+    private fun pendingCheckIn(
+        vaultId: String,
+        ttlExpiresAt: Long = Long.MAX_VALUE,
+        enqueuedAt: Long = 0L
+    ) = PendingCheckIn(
+        vaultId = vaultId,
+        ttlExpiresAt = ttlExpiresAt,
+        enqueuedAt = enqueuedAt
+    )
+
     @Test
     fun testSuccess_removesItemsFromQueueAndNotifies() = runBlocking {
-        val mockItem = PendingCheckIn(vaultId = "vault-123", ttlExpiresAt = 0)
+        val mockItem = pendingCheckIn("vault-123")
         whenever(dao.getAll()).thenReturn(listOf(mockItem))
         whenever(apiClient.checkIn("vault-123")).thenReturn(ApiResult.Success(Unit))
 
@@ -58,8 +73,31 @@ class CheckInSyncWorkerTest {
     }
 
     @Test
+    fun testFifo_syncsInEnqueueOrder() = runBlocking {
+        val first = pendingCheckIn("vault-first", enqueuedAt = 1L)
+        val second = pendingCheckIn("vault-second", enqueuedAt = 2L)
+        val third = pendingCheckIn("vault-third", enqueuedAt = 3L)
+        whenever(dao.getAll()).thenReturn(listOf(first, second, third))
+        whenever(apiClient.checkIn(any())).thenReturn(ApiResult.Success(Unit))
+
+        val worker = TestListenableWorkerBuilder<CheckInSyncWorker>(context)
+            .build()
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        val inOrder = org.mockito.kotlin.inOrder(apiClient, dao)
+        inOrder.verify(apiClient).checkIn("vault-first")
+        inOrder.verify(dao).delete(first)
+        inOrder.verify(apiClient).checkIn("vault-second")
+        inOrder.verify(dao).delete(second)
+        inOrder.verify(apiClient).checkIn("vault-third")
+        inOrder.verify(dao).delete(third)
+    }
+
+    @Test
     fun testRetry_onNetworkFailure() = runBlocking {
-        val mockItem = PendingCheckIn(vaultId = "vault-123", ttlExpiresAt = 0)
+        val mockItem = pendingCheckIn("vault-123")
         whenever(dao.getAll()).thenReturn(listOf(mockItem))
         whenever(apiClient.checkIn("vault-123")).thenReturn(ApiResult.NetworkUnavailable)
 
@@ -69,12 +107,12 @@ class CheckInSyncWorkerTest {
         val result = worker.doWork()
 
         assertEquals(ListenableWorker.Result.retry(), result)
-        verify(dao).deleteNever()
+        verify(dao, never()).delete(any())
     }
 
     @Test
     fun testFailure_removesItemOnApiError() = runBlocking {
-        val mockItem = PendingCheckIn(vaultId = "vault-123", ttlExpiresAt = 0)
+        val mockItem = pendingCheckIn("vault-123")
         whenever(dao.getAll()).thenReturn(listOf(mockItem))
         whenever(apiClient.checkIn("vault-123")).thenReturn(ApiResult.Error("Server error"))
 
@@ -90,11 +128,11 @@ class CheckInSyncWorkerTest {
     @Test
     fun testExpiredItems_notifiesAndRemoves() = runBlocking {
         val nowMillis = System.currentTimeMillis()
-        val expiredItem = PendingCheckIn(
+        val expiredItem = pendingCheckIn(
             vaultId = "vault-expired",
             ttlExpiresAt = nowMillis - 1000
         )
-        val validItem = PendingCheckIn(
+        val validItem = pendingCheckIn(
             vaultId = "vault-valid",
             ttlExpiresAt = nowMillis + 10000
         )
@@ -110,6 +148,9 @@ class CheckInSyncWorkerTest {
         verify(notificationHelper).notifyExpiredCheckInsInQueue(
             vaultIds = listOf("vault-expired")
         )
+        verify(dao).delete(expiredItem)
+        verify(apiClient).checkIn("vault-valid")
+        verify(dao).delete(validItem)
     }
 
     @Test
@@ -122,29 +163,14 @@ class CheckInSyncWorkerTest {
         val result = worker.doWork()
 
         assertEquals(ListenableWorker.Result.success(), result)
+        verify(apiClient, never()).checkIn(any())
+        verify(dao, never()).delete(any())
     }
 
     @Test
     fun testNetworkConstraint_isRequired() {
         val request = CheckInSyncWorker.buildWorkRequest()
-        val constraints = request.constraints
-        assertEquals(androidx.work.NetworkType.CONNECTED, constraints.requiredNetworkType)
+        val constraints = request.workSpec.constraints
+        assertEquals(NetworkType.CONNECTED, constraints.requiredNetworkType)
     }
-}
-
-data class PendingCheckIn(
-    val vaultId: String,
-    val ttlExpiresAt: Long
-)
-
-interface PendingCheckInDao {
-    fun getAll(): List<PendingCheckIn>
-    fun delete(item: PendingCheckIn)
-    fun deleteNever()
-}
-
-interface NotificationHelper {
-    fun notifyExpiredCheckInsInQueue(vaultIds: List<String>)
-    fun notifyCheckInSyncSuccess(vaultId: String)
-    fun cancelQueuedCheckIn()
 }

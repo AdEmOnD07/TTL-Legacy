@@ -41,3 +41,34 @@ interface PendingCheckInDao {
     @Query("SELECT * FROM pending_checkins WHERE ttlExpiresAt > 0 AND ttlExpiresAt < :nowMillis")
     suspend fun getExpired(nowMillis: Long = System.currentTimeMillis()): List<PendingCheckIn>
 }
+
+/**
+ * Room database backing the offline check-in queue.
+ *
+ * The [PendingCheckIn] entity is registered here so the queue survives process
+ * death and can be flushed by the sync worker once connectivity is restored.
+ */
+@Database(
+    entities = [PendingCheckIn::class],
+    version = 1,
+    exportSchema = false
+)
+abstract class CheckInDatabase : RoomDatabase() {
+    abstract fun pendingCheckInDao(): PendingCheckInDao
+
+    companion object {
+        private const val DATABASE_NAME = "checkin_queue.db"
+
+        @Volatile
+        private var INSTANCE: CheckInDatabase? = null
+
+        fun getInstance(context: android.content.Context): CheckInDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    CheckInDatabase::class.java,
+                    DATABASE_NAME
+                ).build().also { INSTANCE = it }
+            }
+    }
+}
