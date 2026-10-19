@@ -11,6 +11,11 @@ use std::fmt;
 /// Protocol fee charged for sponsored release transactions (0.1% of released amount).
 const PROTOCOL_FEE_BASIS_POINTS: u64 = 10; // 10 bps = 0.1%
 
+/// Minimum XLM balance (in stroops) the sponsor account must retain after paying
+/// a fee bump. Stellar requires accounts to keep a base reserve; we treat this
+/// as the fee threshold the sponsor must be able to cover.
+const SPONSOR_FEE_THRESHOLD_STROOPS: i128 = 100;
+
 /// Represents a sponsored release transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SponsoredRelease {
@@ -130,6 +135,48 @@ pub fn calculate_protocol_fee(amount: i128) -> i128 {
     (amount * PROTOCOL_FEE_BASIS_POINTS as i128) / 10_000
 }
 
+/// Check that the sponsor account holds enough XLM to cover the required fee.
+///
+/// Returns a structured [`FeeSponsorsException::SponsorInsufficientBalance`]
+/// error when `available` cannot cover `required`, rather than letting a raw
+/// Stellar SDK error propagate to the caller.
+///
+/// # Arguments
+/// * `available` - Sponsor account XLM balance in stroops
+/// * `required` - Fee amount (in stroops) that must be covered
+pub fn check_sponsor_balance(
+    available: i128,
+    required: i128,
+) -> Result<(), FeeSponsorsException> {
+    if available < required {
+        return Err(FeeSponsorsException::SponsorInsufficientBalance {
+            available,
+            required,
+        });
+    }
+    Ok(())
+}
+
+/// Map a raw Stellar SDK error into a structured fee sponsorship error.
+///
+/// Insufficient-balance errors reported by the SDK are translated into
+/// [`FeeSponsorsException::SponsorInsufficientBalance`] so callers never see
+/// the raw SDK error.
+pub fn map_stellar_sdk_error(
+    sdk_error: &str,
+    available: i128,
+    required: i128,
+) -> FeeSponsorsException {
+    let lowered = sdk_error.to_lowercase();
+    if lowered.contains("insufficient")
+        && (lowered.contains("balance") || lowered.contains("fund"))
+    {
+        FeeSponsorsException::SponsorInsufficientBalance { available, required }
+    } else {
+        FeeSponsorsException::SubmissionFailed(sdk_error.to_string())
+    }
+}
+
 /// Construct a fee bump transaction wrapping the beneficiary's release operation.
 ///
 /// # Arguments
@@ -146,6 +193,33 @@ pub fn construct_fee_bump_transaction(
     net_amount: i128,
     memo: Option<&str>,
 ) -> Result<String, FeeSponsorsException> {
+    construct_fee_bump_transaction_with_balance(
+        beneficiary_account,
+        sponsor_account,
+        net_amount,
+        memo,
+        i128::MAX,
+    )
+}
+
+/// Construct a fee bump transaction, first verifying the sponsor can cover the
+/// required fee threshold.
+///
+/// # Arguments
+/// * `beneficiary_account` - The beneficiary's Stellar account address
+/// * `sponsor_account` - The backend's sponsor account address
+/// * `net_amount` - Amount to transfer after protocol fee deduction
+/// * `memo` - Optional transaction memo
+/// * `sponsor_balance` - Sponsor account XLM balance in stroops
+pub fn construct_fee_bump_transaction_with_balance(
+    beneficiary_account: &str,
+    sponsor_account: &str,
+    net_amount: i128,
+    memo: Option<&str>,
+    sponsor_balance: i128,
+) -> Result<String, FeeSponsorsException> {
+    // Ensure the sponsor can cover the fee threshold before doing any work.
+    check_sponsor_balance(sponsor_balance, SPONSOR_FEE_THRESHOLD_STROOPS)?;
     // Validate accounts
     if beneficiary_account.is_empty() || !is_valid_stellar_account(beneficiary_account) {
         return Err(FeeSponsorsException::InvalidAccount(format!(
@@ -237,6 +311,8 @@ pub enum FeeSponsorsException {
     InvalidAmount(String),
     /// Sponsor account has insufficient balance to cover fees.
     InsufficientSponsorBalance { available: i128, required: i128 },
+    /// Sponsor account has insufficient XLM to cover the fee threshold.
+    SponsorInsufficientBalance { available: i128, required: i128 },
     /// Transaction submission failed.
     SubmissionFailed(String),
 }
@@ -249,6 +325,11 @@ impl fmt::Display for FeeSponsorsException {
             Self::InsufficientSponsorBalance { available, required } => write!(
                 f,
                 "insufficient sponsor balance: available={}, required={}",
+                available, required
+            ),
+            Self::SponsorInsufficientBalance { available, required } => write!(
+                f,
+                "sponsor insufficient balance: available={}, required={}",
                 available, required
             ),
             Self::SubmissionFailed(msg) => write!(f, "submission failed: {}", msg),
@@ -303,11 +384,12 @@ mod sandbox {
                 });
             }
 
-            let tx_hash = construct_fee_bump_transaction(
+            let tx_hash = construct_fee_bump_transaction_with_balance(
                 beneficiary,
                 &self.sponsor_account,
                 breakdown.net_amount,
                 None,
+                self.sponsor_balance,
             )?;
 
             self.sponsor_balance -= breakdown.total_sponsor_fee;
@@ -383,5 +465,72 @@ mod tests {
         // No ledger was consumed and the balance is untouched.
         assert_eq!(sandbox.sponsor_balance, 50);
         assert_eq!(sandbox.ledger_sequence, 1);
+    }
+
+    #[test]
+    fn check_sponsor_balance_rejects_below_threshold() {
+        let err = check_sponsor_balance(50, SPONSOR_FEE_THRESHOLD_STROOPS)
+            .expect_err("balance below threshold should be rejected");
+
+        match err {
+            FeeSponsorsException::SponsorInsufficientBalance { available, required } => {
+                assert_eq!(available, 50);
+                assert_eq!(required, SPONSOR_FEE_THRESHOLD_STROOPS);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_sponsor_balance_accepts_at_threshold() {
+        assert!(check_sponsor_balance(SPONSOR_FEE_THRESHOLD_STROOPS, SPONSOR_FEE_THRESHOLD_STROOPS)
+            .is_ok());
+    }
+
+    #[test]
+    fn construct_fee_bump_rejects_underfunded_sponsor() {
+        let err = construct_fee_bump_transaction_with_balance(
+            BENEFICIARY,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            10_000_000,
+            None,
+            10,
+        )
+        .expect_err("underfunded sponsor should be rejected");
+
+        match err {
+            FeeSponsorsException::SponsorInsufficientBalance { available, required } => {
+                assert_eq!(available, 10);
+                assert_eq!(required, SPONSOR_FEE_THRESHOLD_STROOPS);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sdk_insufficient_balance_error_is_mapped() {
+        let err = map_stellar_sdk_error(
+            "tx_insufficient_balance: account has insufficient balance",
+            25,
+            100,
+        );
+
+        match err {
+            FeeSponsorsException::SponsorInsufficientBalance { available, required } => {
+                assert_eq!(available, 25);
+                assert_eq!(required, 100);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sdk_other_error_is_mapped_to_submission_failed() {
+        let err = map_stellar_sdk_error("tx_bad_seq", 1_000, 100);
+
+        match err {
+            FeeSponsorsException::SubmissionFailed(msg) => assert_eq!(msg, "tx_bad_seq"),
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 }

@@ -37,6 +37,8 @@ tags:
     description: Backup and recovery operations
   - name: Release Simulator
     description: Project vault release dates under different check-in behaviour scenarios
+  - name: Beneficiary
+    description: Beneficiary acceptance, decline, conflict resolution, auctions, and waterfall
 
 paths:
   /health:
@@ -892,7 +894,262 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/vaults/{vault_id}/beneficiary/accept:
+    post:
+      summary: Accept beneficiary designation
+      description: >
+        Beneficiary accepts their designation on a vault. Once accepted, the
+        beneficiary becomes eligible to receive the vault contents on release.
+      operationId: acceptBeneficiary
+      tags:
+        - Beneficiary
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The vault ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeneficiaryActionRequest'
+      responses:
+        '200':
+          description: Beneficiary designation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BeneficiaryStatus'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the designated beneficiary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Beneficiary designation already accepted or declined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/vaults/{vault_id}/beneficiary/decline:
+    post:
+      summary: Decline beneficiary designation
+      description: >
+        Beneficiary declines their designation on a vault. A declined
+        beneficiary is no longer eligible to receive the vault contents.
+      operationId: declineBeneficiary
+      tags:
+        - Beneficiary
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The vault ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeneficiaryActionRequest'
+      responses:
+        '200':
+          description: Beneficiary designation declined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BeneficiaryStatus'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the designated beneficiary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Beneficiary designation already accepted or declined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/vaults/{vault_id}/beneficiary/conflict:
+    get:
+      summary: Get beneficiary conflict status
+      description: >
+        Reports whether the vault has conflicting beneficiary designations
+        (for example, multiple accepted beneficiaries or an accepted
+        beneficiary that no longer matches the on-chain designation).
+      operationId: getBeneficiaryConflict
+      tags:
+        - Beneficiary
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The vault ID
+      responses:
+        '200':
+          description: Conflict status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BeneficiaryConflict'
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/vaults/{vault_id}/beneficiary/auction:
+    post:
+      summary: Start beneficiary auction
+      description: >
+        Starts an auction to resolve competing beneficiary claims on a vault.
+        The auction runs for the configured duration and the highest bidder
+        becomes the beneficiary.
+      operationId: startBeneficiaryAuction
+      tags:
+        - Beneficiary
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The vault ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeneficiaryAuctionRequest'
+      responses:
+        '201':
+          description: Auction started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BeneficiaryAuction'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not permitted to start an auction
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: An auction is already in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/vaults/{vault_id}/beneficiary/waterfall:
+    get:
+      summary: Get beneficiary waterfall
+      description: >
+        Returns the ordered waterfall of beneficiaries and the share of the
+        vault each receives on release.
+      operationId: getBeneficiaryWaterfall
+      tags:
+        - Beneficiary
+      parameters:
+        - name: vault_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The vault ID
+      responses:
+        '200':
+          description: Beneficiary waterfall retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BeneficiaryWaterfall'
+        '404':
+          description: Vault not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/vaults/{vault_id}/vesting/bonus:
+=======
     get:
       summary: Get vesting bonus configuration
       operationId: getVestingBonus
@@ -1572,6 +1829,137 @@ components:
         - seconds_until_release
         - confidence
         - notes
+
+    BeneficiaryStatus:
+      type: string
+      enum: [pending, accepted, declined]
+      description: Current beneficiary designation status
+
+    BeneficiaryActionRequest:
+      type: object
+      properties:
+        beneficiary:
+          type: string
+          description: Stellar account address of the beneficiary performing the action
+        signature:
+          type: string
+          description: Optional signed proof of beneficiary ownership
+      required:
+        - beneficiary
+
+    BeneficiaryConflict:
+      type: object
+      properties:
+        vault_id:
+          type: string
+        has_conflict:
+          type: boolean
+        conflicting_beneficiaries:
+          type: array
+          items:
+            type: string
+          description: Beneficiary addresses involved in the conflict
+        reason:
+          type: string
+          nullable: true
+          description: Human-readable explanation of the conflict
+      required:
+        - vault_id
+        - has_conflict
+        - conflicting_beneficiaries
+
+    BeneficiaryAuctionRequest:
+      type: object
+      properties:
+        initiator:
+          type: string
+          description: Address starting the auction
+        duration_seconds:
+          type: integer
+          format: int64
+          minimum: 60
+          description: Auction duration in seconds
+        reserve_price:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Minimum bid in stroops
+      required:
+        - initiator
+        - duration_seconds
+
+    BeneficiaryAuction:
+      type: object
+      properties:
+        auction_id:
+          type: string
+          format: uuid
+        vault_id:
+          type: string
+        initiator:
+          type: string
+        status:
+          type: string
+          enum: [open, closed, cancelled]
+        reserve_price:
+          type: integer
+          format: int64
+        highest_bid:
+          type: integer
+          format: int64
+          nullable: true
+        highest_bidder:
+          type: string
+          nullable: true
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+      required:
+        - auction_id
+        - vault_id
+        - initiator
+        - status
+        - starts_at
+        - ends_at
+
+    BeneficiaryWaterfallEntry:
+      type: object
+      properties:
+        beneficiary:
+          type: string
+          description: Beneficiary address
+        rank:
+          type: integer
+          minimum: 1
+          description: Position in the waterfall (1 = first to receive)
+        share_bps:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: Share of the vault in basis points
+        status:
+          $ref: '#/components/schemas/BeneficiaryStatus'
+      required:
+        - beneficiary
+        - rank
+        - share_bps
+        - status
+
+    BeneficiaryWaterfall:
+      type: object
+      properties:
+        vault_id:
+          type: string
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/BeneficiaryWaterfallEntry'
+      required:
+        - vault_id
+        - entries
 
     SimulateReleaseResponse:
       type: object
