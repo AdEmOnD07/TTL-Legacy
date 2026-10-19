@@ -18174,6 +18174,9 @@ impl TtlVaultContract {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        if interval_seconds == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
 
         let now = env.ledger().timestamp();
         let recurring = RecurringWithdrawal {
@@ -18195,7 +18198,16 @@ impl TtlVaultContract {
     }
 
     pub fn execute_recurring_withdrawal(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
         let mut vault = Self::load_vault(&env, vault_id);
+        if vault.is_paused {
+            return Err(ContractError::Paused);
+        }
+        if vault.status == ReleaseStatus::EmergencyFrozen || Self::check_vault_frozen(&env, vault_id) {
+            return Err(ContractError::VaultFrozen);
+        }
 
         let recurring = vault
             .recurring_withdrawal
