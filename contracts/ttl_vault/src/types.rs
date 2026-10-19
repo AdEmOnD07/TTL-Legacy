@@ -156,6 +156,9 @@ pub const YIELD_REINVESTED_TOPIC: Symbol = symbol_short!("yld_rin");
 // Wrapped token registration for cross-chain compatibility
 pub const WRAPPED_TOKEN_REGISTERED_TOPIC: Symbol = symbol_short!("wrp_reg");
 pub const WRAPPED_TOKEN_UNREGISTERED_TOPIC: Symbol = symbol_short!("wrp_unr");
+// Issue #1836: vault-scoped bridge config and bridge deposit events
+pub const VAULT_BRIDGE_CONFIG_SET_TOPIC: Symbol = symbol_short!("vbr_cfg");
+pub const VAULT_BRIDGE_DEPOSIT_TOPIC: Symbol = symbol_short!("vbr_dep");
 // Issue #568: withdrawal reversal
 pub const WITHDRAWAL_REVERSED_TOPIC: Symbol = symbol_short!("wd_rev");
 // Issue #1134: withdrawal cancellation
@@ -603,6 +606,8 @@ pub enum StorageKey {
     WithdrawalRateLimit(u64),
     WithdrawalRollback(u64),
     MaxHibernationDuration(u64),
+    // Issue #1836: vault-scoped bridge configuration for cross-chain deposits
+    VaultBridgeConfig(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
