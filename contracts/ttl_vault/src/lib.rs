@@ -443,6 +443,10 @@ pub const MAX_CHECK_IN_INTERVAL: u64 = 315_360_000;
 /// Maximum number of beneficiaries allowed per vault.
 pub const MAX_BENEFICIARIES: u32 = 20;
 
+/// Maximum age (in seconds) of an oracle attestation timestamp before it is
+/// considered stale and rejected (Issue #1832).
+const ORACLE_FRESHNESS_WINDOW: u64 = 5 * SECONDS_PER_MINUTE; // 300 seconds
+
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -617,6 +621,9 @@ pub enum ContractError {
     WhitelistEntryExpired = 150,
     InvalidWhitelistExpiry = 151,
     CheckInTooEarly = 152,
+    // Issue #1832: oracle attestation freshness
+    /// Oracle attestation timestamp is outside the acceptable freshness window.
+    OracleAttestationStale = 153,
 }
 
 #[contract]
@@ -3368,14 +3375,24 @@ impl TtlVaultContract {
     /// * `env` - Soroban environment
     /// * `vault_id` - ID of the vault with the milestone
     /// * `milestone_id` - ID of the milestone to attest
+    /// * `oracle_timestamp` - Unix timestamp embedded in the oracle signature; must be
+    ///   within [`ORACLE_FRESHNESS_WINDOW`] seconds of the current ledger time to prevent
+    ///   replay of old attestations (Issue #1832)
     ///
     /// # Errors
     /// * `ContractError::UnauthorizedAttestor` - Caller is not the designated attestor
     /// * `ContractError::MilestoneNotFound` - Milestone doesn't exist
     /// * `ContractError::MilestoneAlreadyAttested` - Milestone already unlocked
-    pub fn attest_milestone(env: Env, vault_id: u64, milestone_id: u64) {
+    /// * `ContractError::OracleAttestationStale` - `oracle_timestamp` is outside the freshness window
+    pub fn attest_milestone(env: Env, vault_id: u64, milestone_id: u64, oracle_timestamp: u64) {
         Self::assert_not_paused(&env);
         let vault = Self::load_vault(&env, vault_id);
+
+        // Reject replayed / stale oracle signatures (Issue #1832).
+        let now = env.ledger().timestamp();
+        if now < oracle_timestamp || now - oracle_timestamp > ORACLE_FRESHNESS_WINDOW {
+            panic_with_error!(&env, ContractError::OracleAttestationStale);
+        }
 
         // Load milestones
         let milestones_key = StorageKey::VestingMilestones(vault_id);
