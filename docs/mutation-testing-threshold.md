@@ -6,11 +6,15 @@ Mutation testing is a quality assurance technique that measures test coverage by
 
 ## Threshold Configuration
 
-**Current Threshold**: 75%
+**Current Threshold**: 80%
 
-This means that at least 75% of code mutations must be caught by tests. If the survival rate falls below this threshold, the CI job will fail, indicating the need for better test coverage.
+This means that at least 80% of code mutations must be caught by tests. If the survival rate falls below this threshold, the CI job will fail, indicating the need for better test coverage.
 
-## Why 75%?
+## Scope
+
+The mutation run covers the `ttl-vault` package. In particular, the `ranking.rs` and `matching.rs` modules are explicitly in scope and must meet the 80% mutation score threshold.
+
+## Why 80%?
 
 - **Realistic**: Achieves strong test coverage without being unattainable
 - **Motivation**: Ensures critical code paths and edge cases are properly tested
@@ -22,7 +26,7 @@ This means that at least 75% of code mutations must be caught by tests. If the s
 The threshold is defined in `.github/workflows/mutation-testing.yml` in the `THRESHOLD` variable:
 
 ```bash
-THRESHOLD=75
+THRESHOLD=80
 ```
 
 To update the threshold:
