@@ -46,12 +46,17 @@ jobs:
       - name: Run mutation tests
         # Pipe stdout + stderr to a report file so it survives as an artifact.
         # The exit code is ignored because the job is non-blocking.
-        run: cargo mutants --package ttl-vault 2>&1 | tee mutants-report.txt
+        # Scope mutation testing to ranking.rs and matching.rs (Issue #1813).
+        run: |
+          cargo mutants --package ttl-vault \
+            --file src/ranking.rs \
+            --file src/matching.rs \
+            2>&1 | tee mutants-report.txt
 
       - name: Parse mutation score and enforce threshold
         run: |
           REPORT_FILE="mutants-report.txt"
-          THRESHOLD=75
+          THRESHOLD=80
 
           if [ ! -f "$REPORT_FILE" ]; then
             echo "Error: Mutation report not found"
