@@ -26,7 +26,7 @@
 //! # Instrumentation
 //!
 //! Key handler functions are annotated with `#[tracing::instrument]` in
-//! `handlers.rs`. Each span automatically records:
+//! `handlers/`. Each span automatically records:
 //! - Function arguments (vault_id, amounts, etc.)
 //! - Errors via `tracing::error!` / span `record("error", …)`
 //! - Outbound Stellar RPC call spans (see [`stellar_rpc_span`])

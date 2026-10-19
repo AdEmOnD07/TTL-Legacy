@@ -63,7 +63,100 @@ STELLAR_RPC_URL=http://localhost:8000
 
 This points the backend at your local Stellar Quickstart instance instead of testnet.
 
+## Troubleshooting
+
+Common errors encountered when building the Soroban contracts, and how to fix them.
+
+### `wasm32-unknown-unknown` target not found
+
+**Symptom:** Building the contracts fails with an error such as:
+
+```
+error[E0463]: can't find crate for `core`
+  = note: the `wasm32-unknown-unknown` target may not be installed
+```
+
+or
+
+```
+error: target `wasm32-unknown-unknown` not found in target list
+```
+
+**Cause:** The Soroban contracts are compiled to WebAssembly, which requires the
+`wasm32-unknown-unknown` compilation target. A default `rustup` installation only
+includes the host target, so the wasm target must be added explicitly.
+
+**Fix:** Install the target with `rustup`:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+If you use a pinned toolchain (e.g. via `rust-toolchain.toml`), add the target to
+that toolchain specifically:
+
+```bash
+rustup target add wasm32-unknown-unknown --toolchain <toolchain>
+```
+
+Verify the target is installed:
+
+```bash
+rustup target list --installed
+```
+
+You should see `wasm32-unknown-unknown` in the output. Then re-run `just build`
+(or `./scripts/build.sh`).
+
+### `soroban-sdk` version mismatch
+
+**Symptom:** The build fails with errors such as:
+
+```
+error: failed to select a version for the requirement `soroban-sdk = "^21.0.0"`
+candidate versions found which didn't match: 20.0.0
+```
+
+or a type/trait mismatch between crates that depend on different `soroban-sdk`
+versions (e.g. `expected soroban_sdk::Address, found soroban_sdk::Address`).
+
+**Cause:** Cargo resolves a single version of `soroban-sdk` for the whole
+dependency graph. If the workspace `Cargo.toml` and the individual contract
+crates (e.g. `contracts/ttl_vault/Cargo.toml`) pin different versions, Cargo
+either fails to resolve or silently links two incompatible copies of the SDK.
+
+**Fix:** Align the `soroban-sdk` version everywhere it is declared:
+
+1. **Workspace `Cargo.toml`** — define the version once under
+   `[workspace.dependencies]`:
+   ```toml
+   [workspace.dependencies]
+   soroban-sdk = "21.0.0"
+   ```
+
+2. **Each contract crate's `Cargo.toml`** — reference the workspace dependency
+   instead of pinning a version locally:
+   ```toml
+   [dependencies]
+   soroban-sdk = { workspace = true }
+   ```
+
+   If a crate must declare it directly, use the exact same version string as the
+   workspace.
+
+3. **Verify** that only one version is in the dependency graph:
+   ```bash
+   cargo tree -i soroban-sdk
+   ```
+
+   The output should show a single `soroban-sdk vX.Y.Z` entry. If multiple
+   versions appear, update the offending `Cargo.toml` files and run
+   `cargo update -p soroban-sdk` to refresh `Cargo.lock`.
+
+Finally, rebuild the contracts with `just build` to confirm the fix.
+
 ## Development Workflow
+=======
 1. **Fork the repo** and create your branch: git checkout -b feature/your-feature-name.
 2. **Formatting:** We use rustfmt. Please run the following command before committing:
    ```bash

@@ -8,6 +8,9 @@
 ///   Retry  4: +1  h
 ///   Retry  5: +4  h
 ///
+/// If the endpoint responds with a `Retry-After` header (delta-seconds, e.g.
+/// `429 Too Many Requests`), that delay replaces the schedule for that retry.
+///
 /// After all retries are exhausted, status → DeliveryFailed and the vault
 /// owner is notified via email through the configured email provider.
 use std::collections::HashMap;
@@ -83,11 +86,29 @@ pub fn retry_delay_secs(attempt_number: u32) -> Option<u64> {
         .copied()
 }
 
+/// Parses a `Retry-After` header value given as delta-seconds. Bounded to `u32`
+/// so the later `i64` conversion cannot wrap. HTTP-date values are not handled
+/// and fall back to the fixed schedule.
+pub fn parse_retry_after_secs(value: &str) -> Option<u64> {
+    value.trim().parse::<u32>().ok().map(u64::from)
+}
+
 /// Record the outcome of an attempt made at `clock.now()`: bumps
 /// `attempt_count` and sets `status` / `next_retry_at` per the backoff schedule.
 pub fn apply_attempt_outcome(
     delivery: &mut WebhookDelivery,
     success: bool,
+    clock: &dyn Clock,
+) -> AttemptOutcome {
+    apply_attempt_outcome_with_hint(delivery, success, None, clock)
+}
+
+/// As `apply_attempt_outcome`, but a server-provided `retry_after_secs` (from a
+/// `Retry-After` header) overrides the fixed schedule for this retry.
+pub fn apply_attempt_outcome_with_hint(
+    delivery: &mut WebhookDelivery,
+    success: bool,
+    retry_after_secs: Option<u64>,
     clock: &dyn Clock,
 ) -> AttemptOutcome {
     delivery.attempt_count += 1;
@@ -98,13 +119,14 @@ pub fn apply_attempt_outcome(
         return AttemptOutcome::Delivered;
     }
 
-    let Some(delay_secs) = retry_delay_secs(delivery.attempt_count) else {
+    let Some(schedule_secs) = retry_delay_secs(delivery.attempt_count) else {
         delivery.status = WebhookDeliveryStatus::DeliveryFailed;
         delivery.next_retry_at = None;
         return AttemptOutcome::Exhausted;
     };
+    let delay_secs = retry_after_secs.unwrap_or(schedule_secs);
 
-    // Delays are small compile-time constants, so the cast cannot wrap.
+    // Delays are bounded to u32 (schedule constants or parsed Retry-After), so the cast cannot wrap.
     #[allow(clippy::cast_possible_wrap)]
     let delay = chrono::Duration::seconds(delay_secs as i64);
     delivery.status = WebhookDeliveryStatus::Retrying;
@@ -144,6 +166,38 @@ pub fn enqueue(
     db.insert_webhook_delivery(&delivery)
         .map_err(|e| e.to_string())?;
     Ok(delivery)
+}
+
+/// Event type sent to owner endpoints when an on-chain withdrawal escrow is
+/// verified and released (`WITHDRAWAL_ESCROW_VERIFIED_TOPIC`).
+pub const WITHDRAWAL_ESCROW_VERIFIED_EVENT: &str = "withdrawal_escrow_verified";
+
+/// Queue a release-confirmation webhook for every owner endpoint subscribed to
+/// the vault for `WITHDRAWAL_ESCROW_VERIFIED_EVENT`. Returns the number of
+/// deliveries queued. Called by whatever ingests the on-chain verified event.
+pub fn notify_withdrawal_escrow_verified(
+    db: &Arc<Db>,
+    vault_id: &str,
+    amount: i128,
+) -> Result<usize, String> {
+    let subscriptions = db
+        .get_webhook_subscriptions_for_vault(vault_id)
+        .map_err(|e| e.to_string())?;
+
+    let mut queued = 0;
+    for sub in subscriptions.iter().filter(|s| {
+        s.event_types.is_empty()
+            || s.event_types.iter().any(|t| t == WITHDRAWAL_ESCROW_VERIFIED_EVENT)
+    }) {
+        let payload = serde_json::json!({
+            "event": WITHDRAWAL_ESCROW_VERIFIED_EVENT,
+            "vault_id": vault_id,
+            "amount": amount.to_string(),
+        });
+        enqueue(db, vault_id, WITHDRAWAL_ESCROW_VERIFIED_EVENT, payload, &sub.endpoint_url)?;
+        queued += 1;
+    }
+    Ok(queued)
 }
 
 /// Process all pending and due-retry webhook deliveries. Called from the
@@ -195,7 +249,7 @@ async fn attempt_delivery(db: &Arc<Db>, mut delivery: WebhookDelivery, clock: &d
         "webhook_retry: attempting delivery"
     );
 
-    let (http_status, response_body, error) =
+    let (http_status, response_body, error, retry_after_secs) =
         send_webhook(&delivery.endpoint_url, &delivery.payload).await;
 
     let now = clock.now();
@@ -209,7 +263,7 @@ async fn attempt_delivery(db: &Arc<Db>, mut delivery: WebhookDelivery, clock: &d
 
     let success = http_status.map_or(false, |s| (200..300).contains(&s));
 
-    match apply_attempt_outcome(&mut delivery, success, clock) {
+    match apply_attempt_outcome_with_hint(&mut delivery, success, retry_after_secs, clock) {
         AttemptOutcome::Delivered => {
             tracing::info!(
                 delivery_id = %delivery.id,
@@ -253,11 +307,12 @@ async fn attempt_delivery(db: &Arc<Db>, mut delivery: WebhookDelivery, clock: &d
     }
 }
 
-/// HTTP POST to the endpoint. Returns (http_status, response_body, error).
+/// HTTP POST to the endpoint. Returns (http_status, response_body, error,
+/// retry_after_secs).
 async fn send_webhook(
     url: &str,
     payload: &serde_json::Value,
-) -> (Option<u16>, String, Option<String>) {
+) -> (Option<u16>, String, Option<String>, Option<u64>) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -266,18 +321,24 @@ async fn send_webhook(
     match client.post(url).json(payload).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            let retry_after_secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after_secs);
             let body = resp.text().await.unwrap_or_default();
             if (200..300).contains(&status) {
-                (Some(status), body, None)
+                (Some(status), body, None, None)
             } else {
                 (
                     Some(status),
                     body.clone(),
                     Some(format!("HTTP {status}: {body}")),
+                    retry_after_secs,
                 )
             }
         }
-        Err(e) => (None, String::new(), Some(e.to_string())),
+        Err(e) => (None, String::new(), Some(e.to_string()), None),
     }
 }
 
@@ -415,14 +476,16 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< HEAD
     fn failure_email_rate_limit_allows_first_then_blocks() {
         let owner = format!("owner-{}", Uuid::new_v4());
         assert!(failure_email_allowed(&owner), "first email should be allowed");
         assert!(
             !failure_email_allowed(&owner),
             "second email within the window should be rate-limited"
-=======
+        );
+    }
+
+    #[test]
     fn test_enqueue_creates_pending_delivery() {
         let db = test_db();
         let payload = serde_json::json!({"event": "vault_released", "vault_id": "v1"});
@@ -635,7 +698,6 @@ mod tests {
             log[0].status,
             WebhookDeliveryStatus::DeliveryFailed,
             "status should be DeliveryFailed after exhaustion"
->>>>>>> origin/main
         );
     }
 

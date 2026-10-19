@@ -7,6 +7,7 @@ import type {
   RegisterTokenRequest,
   ReminderPreferences,
   SetPreferencesRequest,
+  UpgradeProposal,
 } from "./generated";
 
 export type ApiMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
@@ -121,6 +122,29 @@ export class ApiClient {
       method: "POST",
       body: JSON.stringify(payload),
     });
+  }
+
+  public async getUpgradeProposals(): Promise<UpgradeProposal[]> {
+    return this.request<UpgradeProposal[]>("/api/admin/upgrade-proposals");
+  }
+
+  public async approveUpgradeProposal(id: string | number): Promise<UpgradeProposal> {
+    return this.request<UpgradeProposal>(
+      `/api/admin/upgrade-proposals/${encodeURIComponent(String(id))}/approve`,
+      { method: "POST" },
+    );
+  }
+
+  public async rejectUpgradeProposal(id: string | number): Promise<UpgradeProposal> {
+    return this.request<UpgradeProposal>(
+      `/api/admin/upgrade-proposals/${encodeURIComponent(String(id))}/reject`,
+      { method: "POST" },
+    );
+  }
+
+  public async getContractAdmin(): Promise<string> {
+    const response = await this.request<{ admin: string }>("/api/admin/contract-admin");
+    return response.admin;
   }
 
   public async request<T>(path: string, init: RequestInit = {}): Promise<T> {

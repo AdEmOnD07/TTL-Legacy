@@ -41,7 +41,9 @@ pub use db::Db;
 // that includes the Metrics field (issue #1195).
 
 use crate::metrics::Metrics;
-use crate::rate_limit::{InMemoryRateLimitStore, RateLimitStore, RedisRateLimitStore};
+use crate::rate_limit::{
+    InMemoryRateLimitStore, RateLimitStore, RedisRateLimitStore, TrustedProxies,
+};
 
 /// Default grace period for draining in-flight background work on shutdown.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,6 +59,10 @@ pub struct AppState {
     /// set `RATE_LIMIT_STORE=redis` (with `REDIS_URL`) to share state across
     /// replicas and survive restarts.
     pub rate_limit_store: Arc<dyn RateLimitStore>,
+    /// Trusted reverse-proxy networks (issue #1819). When the peer address
+    /// falls inside one of these ranges, the client IP is taken from
+    /// `X-Forwarded-For` / `X-Real-IP` instead of the socket address.
+    pub trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl FromRef<AppState> for Arc<Db> {
@@ -75,6 +81,36 @@ impl FromRef<AppState> for Arc<dyn RateLimitStore> {
     fn from_ref(state: &AppState) -> Arc<dyn RateLimitStore> {
         Arc::clone(&state.rate_limit_store)
     }
+}
+
+impl FromRef<AppState> for Arc<TrustedProxies> {
+    fn from_ref(state: &AppState) -> Arc<TrustedProxies> {
+        Arc::clone(&state.trusted_proxies)
+    }
+}
+
+/// Builds the trusted-proxy list from the `TRUSTED_PROXIES` environment
+/// variable (issue #1819).
+///
+/// The value is a comma-separated list of CIDR ranges or bare IPs, e.g.
+/// `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1`. Whitespace around each
+/// entry is trimmed and empty entries are ignored. Invalid entries are logged
+/// and skipped. When the variable is unset or empty, no proxies are trusted
+/// and the limiter falls back to the peer socket address.
+fn build_trusted_proxies() -> Arc<TrustedProxies> {
+    let raw = std::env::var("TRUSTED_PROXIES").unwrap_or_default();
+    let proxies = TrustedProxies::from_csv(&raw);
+    if proxies.is_empty() {
+        tracing::info!(
+            "no TRUSTED_PROXIES configured; rate limiter will use the peer socket address"
+        );
+    } else {
+        tracing::info!(
+            "rate limiter trusting {} proxy network(s) from TRUSTED_PROXIES",
+            proxies.len()
+        );
+    }
+    Arc::new(proxies)
 }
 
 /// Builds the rate-limit store from environment configuration (issue #1494).
@@ -102,6 +138,24 @@ fn build_rate_limit_store() -> Arc<dyn RateLimitStore> {
     }
     tracing::info!("rate limiter using in-memory store");
     Arc::new(InMemoryRateLimitStore::new())
+}
+
+/// Builds the application state, wiring the rate-limit store and the
+/// trusted-proxy configuration (issues #1494, #1819).
+fn build_app_state(
+    db: Arc<Db>,
+    consensus: Arc<NodeCache>,
+    metrics: Arc<Metrics>,
+    shutdown: CancellationToken,
+) -> AppState {
+    AppState {
+        db,
+        consensus,
+        metrics,
+        shutdown,
+        rate_limit_store: build_rate_limit_store(),
+        trusted_proxies: build_trusted_proxies(),
+    }
 }
 
 /// Parses the `CORS_ALLOWED_ORIGINS` environment variable into a list of

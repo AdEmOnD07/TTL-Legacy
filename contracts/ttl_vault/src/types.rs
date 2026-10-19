@@ -1,11 +1,5 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, String, Symbol, Vec};
 
-/// Maximum number of vesting schedules per vault.
-pub const MAX_VESTING_SCHEDULES: u32 = 20;
-
-/// Maximum number of beneficiaries allowed per vault.
-pub const MAX_BENEFICIARIES: u32 = 20;
-
 pub const RELEASE_TOPIC: Symbol = symbol_short!("release");
 pub const VAULT_CREATED_TOPIC: Symbol = symbol_short!("v_created");
 pub const PING_EXPIRY_TOPIC: Symbol = symbol_short!("ping_exp");
@@ -76,12 +70,6 @@ pub const CONFLICT_CLAIMED_TOPIC: Symbol = symbol_short!("conf_clm");
 pub const CONFLICT_AUTO_RESOLVED_TOPIC: Symbol = symbol_short!("conf_aut");
 pub const CONFLICT_PRIORITY_SET_TOPIC: Symbol = symbol_short!("conf_pri");
 pub const CONFLICT_DISPUTE_WINDOW_SET_TOPIC: Symbol = symbol_short!("conf_dw");
-/// Default dispute window before a conflict can be auto-resolved (72 hours)
-pub const DEFAULT_CONFLICT_DISPUTE_WINDOW: u64 = 72 * 60 * 60;
-/// Minimum dispute window (1 hour)
-pub const MIN_CONFLICT_DISPUTE_WINDOW: u64 = 60 * 60;
-/// Maximum dispute window (30 days)
-pub const MAX_CONFLICT_DISPUTE_WINDOW: u64 = 30 * 24 * 60 * 60;
 pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
 pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 // Issue #934: emergency vault recovery code
@@ -245,6 +233,7 @@ pub const TOKEN_REBALANCED_TOPIC: Symbol = symbol_short!("tok_rebd");
 
 // Issue #529: beneficiary pooling
 pub const POOL_CREATED_TOPIC: Symbol = symbol_short!("pool_crt");
+pub const POOL_REDIST_TOPIC: Symbol = symbol_short!("pool_rdst");
 
 // Issue #813: admin transfer timelock
 pub const ADMIN_TRANSFER_PROPOSED_TOPIC: Symbol = symbol_short!("adm_prop");
@@ -386,23 +375,6 @@ pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 #[allow(dead_code)]
 pub const RECOVERY_EXTENSION_DURATION: u64 = 2_592_000;
 
-/// Maximum length for vault metadata string
-pub const MAX_METADATA_LEN: u32 = 256;
-
-/// Maximum length for vault name
-pub const MAX_NAME_LEN: u32 = 64;
-
-/// Maximum length for vault description
-pub const MAX_DESCRIPTION_LEN: u32 = 512;
-
-/// Maximum length for vault notes
-pub const MAX_NOTES_LEN: u32 = 1024;
-
-/// Maximum length for custom metadata bytes (2KB) - Issue #378
-pub const MAX_CUSTOM_METADATA_LEN: u32 = 2048;
-/// Maximum length, in bytes, of a vault's release memo (Issue #791).
-pub const MAX_RELEASE_MEMO_LEN: u32 = 256;
-
 #[contracttype(export = false)]
 #[derive(Clone)]
 pub enum StorageKey {
@@ -463,6 +435,8 @@ pub enum StorageKey {
     VaultSnapshotTimestamps(u64),
     // Issue #482: TTL prediction history
     CheckInHistory(u64),
+    // Issue #1767: capped list of recent deposit events for audit queries
+    DepositHistory(u64),
     // Issue #873: individual check-in history entry for paginated access
     CheckInEntry(u64, u32),
     // Issue #873: ring buffer head pointer for check-in history
@@ -558,6 +532,8 @@ pub enum StorageKey {
     BeneficiaryAuction(u64),
     BeneficiaryAuctionBid(u64, Address),
     BeneficiaryAuctionCount,
+    // Issue #1806: minimum winning bid required to finalize a beneficiary auction
+    BeneficiaryAuctionReserve(u64),
     // Issue #809: two-step protocol configuration
     PendingProtocolConfig,
     ProtocolConfigProposedAt,
@@ -598,6 +574,10 @@ pub enum StorageKey {
     ConflictDisputeWindow(u64),
     /// Owner-designated priority beneficiary address for conflict tie-breaking.
     ConflictPriorityBeneficiary(u64),
+    /// Identity oracle contract address that KYC-gates beneficiary claims for a vault.
+    BeneficiaryIdentityOracle(u64),
+    /// Marks a beneficiary of a vault as identity-verified by the vault's identity oracle.
+    BeneficiaryIdentityVerified(u64, Address),
     BeneficiaryVaultLimit,
     CompromisedPasskeys(u64),
     CountdownConfig(u64),
@@ -629,6 +609,16 @@ pub enum StorageKey {
 #[contracttype]
 #[derive(Clone)]
 pub struct CheckInHistoryEntry {
+    pub timestamp: u64,
+}
+
+/// Deposit history entry for audit queries - Issue #1767
+#[contracttype]
+#[derive(Clone)]
+pub struct DepositHistoryEntry {
+    pub depositor: Address,
+    pub amount: i128,
+    pub new_balance: i128,
     pub timestamp: u64,
 }
 
@@ -1002,6 +992,7 @@ pub struct VaultHealthSummary {
     pub ttl_remaining: Option<u64>,
     pub balance: i128,
     pub is_paused: bool,
+    pub check_in_streak: CheckInStreak,
 }
 
 #[contracttype]
@@ -1310,13 +1301,6 @@ pub struct WithdrawalAuditEntry {
     pub success: bool,
     pub error_reason: String,
 }
-
-/// Maximum number of withdrawal events kept in the per-vault ring buffer.
-///
-/// Older entries are silently evicted once this limit is reached, keeping
-/// on-chain storage bounded regardless of how many withdrawals a vault
-/// accumulates over its lifetime.
-pub const MAX_WITHDRAWAL_HISTORY: u32 = 50;
 
 /// On-chain withdrawal event record stored in the ring buffer - Issue #1293
 ///
@@ -1684,6 +1668,10 @@ pub struct BeneficiaryPool {
     pub pool_id: u64,
     pub members: Vec<Address>,
     pub total_bps: u32,
+    /// Unix timestamp after which unclaimed shares are redistributed (0 = no deadline).
+    pub claim_deadline: u64,
+    /// Members that have claimed their share before the deadline.
+    pub claimed: Vec<Address>,
 }
 
 /// Beneficiary-specific vesting schedule - Issue #525.
@@ -2000,12 +1988,6 @@ pub struct WithdrawalApprovalRequest {
 
 /// Timelock delay (seconds) applied to admin ownership transfers.
 pub const ADMIN_TRANSFER_TIMELOCK: u64 = 172_800;
-
-/// Default minimum interval (seconds) between consecutive check-ins.
-pub const DEFAULT_MIN_CHECKIN_COOLDOWN: u64 = 60;
-
-/// Maximum number of seconds a single acceleration call may advance the deadline.
-pub const MAX_ACCELERATE_SECONDS: u64 = 2_592_000;
 
 /// Expiry (seconds) for pending multi-signature operations once created.
 pub const PENDING_MULTISIG_OP_EXPIRY: u64 = 604_800;
