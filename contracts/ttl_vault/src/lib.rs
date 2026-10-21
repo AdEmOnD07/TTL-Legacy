@@ -58,7 +58,7 @@ pub use types::{
     TWO_FACTOR_DISABLED_TOPIC, TWO_FACTOR_ENABLED_TOPIC, TWO_FACTOR_VERIFIED_TOPIC,
     VestingAccelerationConfig, VestingForfeitureConfig, VestingMilestone,
     VestingRolloverConfig, VestingStaggerEntry, WithdrawalApprovalRequest,
-    BeneficiaryConditionalAcceptance, BeneficiaryConditionalDecline,
+    BeneficiaryConditionalAcceptance, BeneficiaryConditionalDecline, BeneficiaryConditionResponse,
     ACCEPTANCE_CONDITIONS_SET_TOPIC, ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC,
     ADMIN_TRANSFER_COMPLETED_TOPIC,
     ADMIN_TRANSFER_PROPOSED_TOPIC,
@@ -3659,8 +3659,8 @@ impl TtlVaultContract {
             }
         }
 
-        // Check beneficiary conditional acceptance threshold - Issue #503
-        if !Self::check_conditional_acceptance_threshold(&env, vault_id, total).unwrap_or(false) {
+        // Check beneficiary conditional acceptance/decline threshold - Issue #503, #1849
+        if !Self::check_beneficiary_condition_threshold(&env, vault_id, total).unwrap_or(false) {
             panic_with_error!(&env, ContractError::InsufficientBalance);
         }
 
@@ -12601,9 +12601,11 @@ impl TtlVaultContract {
             accepted_at: env.ledger().timestamp(),
         };
 
+        let response = BeneficiaryConditionResponse::Acceptance(acceptance);
+
         env.storage().persistent().set(
-            &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
-            &acceptance,
+            &StorageKey::BeneficiaryConditionResponse(vault_id),
+            &response,
         );
 
         env.events().publish(
@@ -12611,22 +12613,22 @@ impl TtlVaultContract {
             (vault_id, vault.beneficiary.clone(), min_balance_threshold),
         );
         env.storage().persistent().extend_ttl(
-            &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
+            &StorageKey::BeneficiaryConditionResponse(vault_id),
             VAULT_TTL_THRESHOLD,
             vault_ttl_ledgers(vault.check_in_interval),
         );
         Ok(())
     }
 
-    /// Gets beneficiary conditional acceptance if it exists.
-    pub fn get_beneficiary_cond_acceptance(
+    /// Gets beneficiary condition response (acceptance or decline) if it exists.
+    pub fn get_beneficiary_condition_response(
         env: Env,
         vault_id: u64,
-    ) -> Option<BeneficiaryConditionalAcceptance> {
+    ) -> Option<BeneficiaryConditionResponse> {
         env.storage()
             .persistent()
-            .get::<StorageKey, BeneficiaryConditionalAcceptance>(
-                &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
+            .get::<StorageKey, BeneficiaryConditionResponse>(
+                &StorageKey::BeneficiaryConditionResponse(vault_id),
             )
     }
 
@@ -12671,9 +12673,11 @@ impl TtlVaultContract {
             reason,
         };
 
+        let response = BeneficiaryConditionResponse::Decline(decline);
+
         env.storage()
             .persistent()
-            .set(&StorageKey::ConditionalDecline(vault_id), &decline);
+            .set(&StorageKey::BeneficiaryConditionResponse(vault_id), &response);
 
         env.events().publish(
             (BENEFICIARY_DECLINED_TOPIC,),
@@ -12681,7 +12685,7 @@ impl TtlVaultContract {
         );
 
         env.storage().persistent().extend_ttl(
-            &StorageKey::ConditionalDecline(vault_id),
+            &StorageKey::BeneficiaryConditionResponse(vault_id),
             VAULT_TTL_THRESHOLD,
             vault_ttl_ledgers(vault.check_in_interval),
         );
@@ -12689,33 +12693,32 @@ impl TtlVaultContract {
         Ok(())
     }
 
-    /// Gets beneficiary conditional decline if it exists.
-    pub fn get_beneficiary_cond_decline(
-        env: Env,
-        vault_id: u64,
-    ) -> Option<BeneficiaryConditionalDecline> {
-        env.storage()
-            .persistent()
-            .get::<StorageKey, BeneficiaryConditionalDecline>(&StorageKey::ConditionalDecline(
-                vault_id,
-            ))
-    }
-
-    /// Checks if beneficiary conditional acceptance conditions are met.
-    fn check_conditional_acceptance_threshold(
+    /// Checks if beneficiary conditional acceptance/decline conditions are met.
+    /// Returns Ok(true) if conditions are satisfied (or no condition set), Ok(false) if not met,
+    /// Err if there's an error.
+    fn check_beneficiary_condition_threshold(
         env: &Env,
         vault_id: u64,
         current_balance: i128,
     ) -> Result<bool, ContractError> {
-        if let Some(acceptance) = env
+        if let Some(response) = env
             .storage()
             .persistent()
-            .get::<StorageKey, BeneficiaryConditionalAcceptance>(
-                &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
+            .get::<StorageKey, BeneficiaryConditionResponse>(
+                &StorageKey::BeneficiaryConditionResponse(vault_id),
             )
         {
-            if current_balance < acceptance.min_balance_threshold {
-                return Ok(false);
+            match response {
+                BeneficiaryConditionResponse::Acceptance(acceptance) => {
+                    if current_balance < acceptance.min_balance_threshold {
+                        return Ok(false);
+                    }
+                }
+                BeneficiaryConditionResponse::Decline(decline) => {
+                    if current_balance > decline.max_balance_threshold {
+                        return Ok(false);
+                    }
+                }
             }
         }
 
@@ -12749,6 +12752,38 @@ impl TtlVaultContract {
         }
 
         Ok(true)
+    }
+
+    // Backward compatibility wrappers for existing tests and external callers
+    /// @deprecated Use get_beneficiary_condition_response instead
+    pub fn get_beneficiary_cond_acceptance(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConditionalAcceptance> {
+        Self::get_beneficiary_condition_response(env, vault_id).and_then(|r| match r {
+            BeneficiaryConditionResponse::Acceptance(a) => Some(a),
+            _ => None,
+        })
+    }
+
+    /// @deprecated Use get_beneficiary_condition_response instead
+    pub fn get_beneficiary_cond_decline(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConditionalDecline> {
+        Self::get_beneficiary_condition_response(env, vault_id).and_then(|r| match r {
+            BeneficiaryConditionResponse::Decline(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    /// @deprecated Use check_beneficiary_condition_threshold instead
+    fn check_conditional_acceptance_threshold(
+        env: &Env,
+        vault_id: u64,
+        current_balance: i128,
+    ) -> Result<bool, ContractError> {
+        Self::check_beneficiary_condition_threshold(env, vault_id, current_balance)
     }
 
     /// Sets escalating acceptance conditions for a vault's beneficiary release.

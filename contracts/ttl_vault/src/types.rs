@@ -411,6 +411,7 @@ pub enum StorageKey {
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
     ConditionalDecline(u64),
+    BeneficiaryConditionResponse(u64),
     ArchivedVault(u64),
     MaxTtlSeconds,
     TtlDecayRate,
@@ -1178,6 +1179,15 @@ pub struct BeneficiaryConditionalDecline {
     pub max_balance_threshold: i128,
     pub declined_at: u64,
     pub reason: String,
+}
+
+/// Unified beneficiary condition response - Issue #1849
+/// Represents either a conditional acceptance or conditional decline from a beneficiary
+#[contracttype]
+#[derive(Clone)]
+pub enum BeneficiaryConditionResponse {
+    Acceptance(BeneficiaryConditionalAcceptance),
+    Decline(BeneficiaryConditionalDecline),
 }
 
 /// Beneficiary delegation of claim rights to a trusted proxy address - Issue #944
