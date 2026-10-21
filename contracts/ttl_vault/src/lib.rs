@@ -158,12 +158,14 @@ pub use types::{
     PASSKEY_EXPIRED_TOPIC,
     PASSKEY_EXPIRY_EXTENDED_TOPIC,
     PASSKEY_LOCKOUT_TOPIC,
+    PASSKEY_LOCKOUT_THRESHOLD_SET_TOPIC,
     PASSKEY_RECOVERED_TOPIC,
     PASSKEY_RECOVERY_INITIATED_TOPIC,
     PASSKEY_ROTATION_ENFORCED_TOPIC,
     PASSKEY_ROTATION_REQUIRED_TOPIC,
     PASSKEY_UNLOCKED_TOPIC,
     PASSKEY_USAGE_TOPIC,
+    PASSKEY_WEBAUTHN_BACKUP_SET_TOPIC,
     PAUSE_TOPIC,
     PAUSE_VAULT_TOPIC,
     PENDING_MULTISIG_OP_COSIGNED_TOPIC,
@@ -9993,6 +9995,134 @@ impl TtlVaultContract {
         }
     }
 
+    /// Set the passkey lockout threshold (failed attempts before lockout) — Issue #1847.
+    ///
+    /// Only the vault owner can configure this. Default is 5 if not set.
+    pub fn set_passkey_lockout_threshold(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        threshold: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        if threshold == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // Read existing lockout or create default with threshold
+        let mut lockout = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, PasskeyLockout>(&StorageKey::PasskeyLockout(vault_id))
+            .unwrap_or(PasskeyLockout {
+                locked_at: 0,
+                unlock_at: 0,
+                failed_attempts: 0,
+                threshold,
+            });
+
+        lockout.threshold = threshold;
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::PasskeyLockout(vault_id), &lockout);
+
+        env.events().publish(
+            (PASSKEY_LOCKOUT_THRESHOLD_SET_TOPIC, vault_id),
+            threshold,
+        );
+        Ok(())
+    }
+
+    /// Get the current passkey lockout threshold for a vault.
+    pub fn get_passkey_lockout_threshold(env: Env, vault_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<StorageKey, PasskeyLockout>(&StorageKey::PasskeyLockout(vault_id))
+            .map(|l| l.threshold)
+            .unwrap_or(5) // Default threshold
+    }
+
+    /// Record a failed passkey attempt and check if lockout should be triggered — Issue #1847.
+    ///
+    /// Returns true if the vault is now locked out.
+    pub fn record_passkey_failed_attempt(
+        env: Env,
+        vault_id: u64,
+        lockout_duration_seconds: u64,
+    ) -> Result<bool, ContractError> {
+        let vault = Self::load_vault(&env, vault_id);
+
+        // Get or create lockout state
+        let mut lockout = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, PasskeyLockout>(&StorageKey::PasskeyLockout(vault_id))
+            .unwrap_or(PasskeyLockout {
+                locked_at: 0,
+                unlock_at: 0,
+                failed_attempts: 0,
+                threshold: 5, // Default threshold
+            });
+
+        // If already locked out, don't increment
+        if env.ledger().timestamp() < lockout.unlock_at {
+            return Ok(true);
+        }
+
+        lockout.failed_attempts += 1;
+
+        // Check if threshold reached
+        if lockout.failed_attempts >= lockout.threshold {
+            // Trigger lockout
+            lockout.locked_at = env.ledger().timestamp();
+            lockout.unlock_at = env.ledger().timestamp() + lockout_duration_seconds;
+            lockout.failed_attempts = 0; // Reset counter after lockout
+
+            env.storage()
+                .persistent()
+                .set(&StorageKey::PasskeyLockout(vault_id), &lockout);
+
+            env.events().publish(
+                (PASSKEY_LOCKOUT_TOPIC, vault_id),
+                lockout_duration_seconds,
+            );
+
+            return Ok(true);
+        }
+
+        // Save updated attempt count
+        env.storage()
+            .persistent()
+            .set(&StorageKey::PasskeyLockout(vault_id), &lockout);
+
+        Ok(false)
+    }
+
+    /// Reset failed passkey attempts counter (called on successful check-in).
+    pub fn reset_passkey_failed_attempts(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+
+        if let Some(mut lockout) = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, PasskeyLockout>(&StorageKey::PasskeyLockout(vault_id))
+        {
+            lockout.failed_attempts = 0;
+            env.storage()
+                .persistent()
+                .set(&StorageKey::PasskeyLockout(vault_id), &lockout);
+        }
+
+        Ok(())
+    }
+
     // --- Issue #561: Passkey Rotation Enforcement ---
 
     pub fn set_passkey_rotation_policy(
@@ -11520,6 +11650,7 @@ impl TtlVaultContract {
             deprecated_at: None,
             usage_count: 0,
             last_used_timestamp: 0,
+            webauthn_backup_eligible: false,
         });
 
         env.storage().persistent().set(&key, &passkeys);
@@ -11532,6 +11663,55 @@ impl TtlVaultContract {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
             .publish((ADD_PASSKEY_TOPIC, vault_id), passkey_hash);
+        Ok(())
+    }
+
+    /// Sets the WebAuthn credential backup eligibility flag for a passkey — Issue #1848.
+    ///
+    /// Only the vault owner can call this. When enabled, the passkey is marked as
+    /// eligible for WebAuthn credential backup, allowing it to be synced across
+    /// devices via platform authenticators (e.g., iCloud Keychain, Google Password Manager).
+    pub fn set_passkey_webauthn_backup_eligible(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+        eligible: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let key = StorageKey::VaultPasskeys(vault_id);
+        let mut passkeys: Vec<PasskeyHash> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..passkeys.len() {
+            let mut pk = passkeys.get(i).unwrap();
+            if pk.hash == passkey_hash {
+                pk.webauthn_backup_eligible = eligible;
+                passkeys.set(i, pk);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(ContractError::InvalidPasskey);
+        }
+
+        env.storage().persistent().set(&key, &passkeys);
+        env.events()
+            .publish((PASSKEY_WEBAUTHN_BACKUP_SET_TOPIC, vault_id), (passkey_hash, eligible));
         Ok(())
     }
 
@@ -11887,6 +12067,7 @@ impl TtlVaultContract {
                 passkey_hash: pk.hash,
                 usage_count: pk.usage_count,
                 last_used_timestamp: pk.last_used_timestamp,
+                webauthn_backup_eligible: pk.webauthn_backup_eligible,
             });
         }
         result

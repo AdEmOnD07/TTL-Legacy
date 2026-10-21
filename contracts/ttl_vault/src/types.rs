@@ -190,12 +190,16 @@ pub const PASSKEY_COMPROMISED_TOPIC: Symbol = symbol_short!("pk_comp");
 pub const WITHDRAWAL_APPROVAL_REQUESTED_TOPIC: Symbol = symbol_short!("wd_req");
 pub const WITHDRAWAL_APPROVAL_GRANTED_TOPIC: Symbol = symbol_short!("wd_grant");
 pub const WITHDRAWAL_APPROVAL_DENIED_TOPIC: Symbol = symbol_short!("wd_deny");
+// Issue #1848: WebAuthn credential backup eligibility
+pub const PASSKEY_WEBAUTHN_BACKUP_SET_TOPIC: Symbol = symbol_short!("pk_wbk");
 // Issue #563: passkey recovery
 pub const PASSKEY_RECOVERY_INITIATED_TOPIC: Symbol = symbol_short!("pk_rec");
 pub const PASSKEY_RECOVERED_TOPIC: Symbol = symbol_short!("pk_rcvd");
 // Issue #562: passkey compromise response
 pub const PASSKEY_LOCKOUT_TOPIC: Symbol = symbol_short!("pk_lock");
 pub const PASSKEY_UNLOCKED_TOPIC: Symbol = symbol_short!("pk_unlk");
+// Issue #1847: passkey lockout threshold configuration
+pub const PASSKEY_LOCKOUT_THRESHOLD_SET_TOPIC: Symbol = symbol_short!("pk_lk_th");
 // Issue #561: passkey rotation enforcement
 pub const PASSKEY_ROTATION_REQUIRED_TOPIC: Symbol = symbol_short!("pk_rot_r");
 pub const PASSKEY_ROTATION_ENFORCED_TOPIC: Symbol = symbol_short!("pk_rot_e");
@@ -861,6 +865,8 @@ pub struct PasskeyHash {
     pub deprecated_at: Option<u64>,
     pub usage_count: u64,
     pub last_used_timestamp: u64,
+    /// Whether this passkey is eligible for WebAuthn credential backup — Issue #1848
+    pub webauthn_backup_eligible: bool,
 }
 
 /// Backup code entry - Issue #393
@@ -1086,6 +1092,8 @@ pub struct PasskeyAnalytics {
     pub passkey_hash: BytesN<32>,
     pub usage_count: u64,
     pub last_used_timestamp: u64,
+    /// Whether this passkey is eligible for WebAuthn credential backup — Issue #1848
+    pub webauthn_backup_eligible: bool,
 }
 
 /// Beneficiary status enum - Issue #397
@@ -1902,6 +1910,8 @@ pub struct PasskeyLockout {
     pub locked_at: u64,
     pub unlock_at: u64,
     pub failed_attempts: u32,
+    /// Configurable threshold of failed attempts that triggers lockout - Issue #1847
+    pub threshold: u32,
 }
 
 /// Pending passkey recovery request initiated via approved contacts (Issue #563).
