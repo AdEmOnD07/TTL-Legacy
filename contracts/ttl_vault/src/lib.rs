@@ -3547,6 +3547,10 @@ impl TtlVaultContract {
         if Self::check_vault_frozen(&env, vault_id) {
             panic_with_error!(&env, ContractError::VaultFrozen);
         }
+        // Issue #1853: Owner lock must block beneficiary-triggered release
+        if Self::is_owner_vault_locked(env.clone(), vault_id) {
+            panic_with_error!(&env, ContractError::VaultOwnerLocked);
+        }
         if env
             .storage()
             .persistent()
