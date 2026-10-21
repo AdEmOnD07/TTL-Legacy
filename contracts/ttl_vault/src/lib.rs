@@ -410,6 +410,7 @@ fn vault_ttl_ledgers(check_in_interval: u64) -> u32 {
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
+// Every `panic_with_error!` in this file already uses a `ContractError` variant (issue #1761).
 pub enum ContractError {
     AlreadyInitialized = 1,
     InvalidInterval = 2,
