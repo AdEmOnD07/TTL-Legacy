@@ -58,7 +58,8 @@ pub use types::{
     TWO_FACTOR_DISABLED_TOPIC, TWO_FACTOR_ENABLED_TOPIC, TWO_FACTOR_VERIFIED_TOPIC,
     VestingAccelerationConfig, VestingForfeitureConfig, VestingMilestone,
     VestingRolloverConfig, VestingStaggerEntry, WithdrawalApprovalRequest,
-    BeneficiaryConditionalAcceptance, BeneficiaryConditionalDecline,
+    BeneficiaryConditionResponse,
+    BeneficiaryConditionResponseType,
     ACCEPTANCE_CONDITIONS_SET_TOPIC, ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, ADD_PASSKEY_TOPIC,
     ADMIN_TRANSFER_COMPLETED_TOPIC,
     ADMIN_TRANSFER_PROPOSED_TOPIC,
@@ -12596,14 +12597,16 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidAmount);
         }
 
-        let acceptance = BeneficiaryConditionalAcceptance {
-            min_balance_threshold,
-            accepted_at: env.ledger().timestamp(),
+        let response = BeneficiaryConditionResponse {
+            response: BeneficiaryConditionResponseType::Accept,
+            threshold: min_balance_threshold,
+            timestamp: env.ledger().timestamp(),
+            reason: None,
         };
 
         env.storage().persistent().set(
-            &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
-            &acceptance,
+            &StorageKey::BeneficiaryConditionResponse(vault_id),
+            &response,
         );
 
         env.events().publish(
@@ -12611,22 +12614,22 @@ impl TtlVaultContract {
             (vault_id, vault.beneficiary.clone(), min_balance_threshold),
         );
         env.storage().persistent().extend_ttl(
-            &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
+            &StorageKey::BeneficiaryConditionResponse(vault_id),
             VAULT_TTL_THRESHOLD,
             vault_ttl_ledgers(vault.check_in_interval),
         );
         Ok(())
     }
 
-    /// Gets beneficiary conditional acceptance if it exists.
-    pub fn get_beneficiary_cond_acceptance(
+    /// Gets beneficiary conditional response if it exists.
+    pub fn get_beneficiary_cond_response(
         env: Env,
         vault_id: u64,
-    ) -> Option<BeneficiaryConditionalAcceptance> {
+    ) -> Option<BeneficiaryConditionResponse> {
         env.storage()
             .persistent()
-            .get::<StorageKey, BeneficiaryConditionalAcceptance>(
-                &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
+            .get::<StorageKey, BeneficiaryConditionResponse>(
+                &StorageKey::BeneficiaryConditionResponse(vault_id),
             )
     }
 
@@ -12665,15 +12668,16 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidAmount);
         }
 
-        let decline = BeneficiaryConditionalDecline {
-            max_balance_threshold,
-            declined_at: env.ledger().timestamp(),
-            reason,
+        let decline = BeneficiaryConditionResponse {
+            response: BeneficiaryConditionResponseType::Decline,
+            threshold: max_balance_threshold,
+            timestamp: env.ledger().timestamp(),
+            reason: Some(reason),
         };
 
         env.storage()
             .persistent()
-            .set(&StorageKey::ConditionalDecline(vault_id), &decline);
+            .set(&StorageKey::BeneficiaryConditionResponse(vault_id), &decline);
 
         env.events().publish(
             (BENEFICIARY_DECLINED_TOPIC,),
@@ -12681,7 +12685,7 @@ impl TtlVaultContract {
         );
 
         env.storage().persistent().extend_ttl(
-            &StorageKey::ConditionalDecline(vault_id),
+            &StorageKey::BeneficiaryConditionResponse(vault_id),
             VAULT_TTL_THRESHOLD,
             vault_ttl_ledgers(vault.check_in_interval),
         );
@@ -12689,14 +12693,14 @@ impl TtlVaultContract {
         Ok(())
     }
 
-    /// Gets beneficiary conditional decline if it exists.
-    pub fn get_beneficiary_cond_decline(
+    /// Gets beneficiary conditional response if it exists.
+    pub fn get_beneficiary_cond_response(
         env: Env,
         vault_id: u64,
-    ) -> Option<BeneficiaryConditionalDecline> {
+    ) -> Option<BeneficiaryConditionResponse> {
         env.storage()
             .persistent()
-            .get::<StorageKey, BeneficiaryConditionalDecline>(&StorageKey::ConditionalDecline(
+            .get::<StorageKey, BeneficiaryConditionResponse>(&StorageKey::BeneficiaryConditionResponse(
                 vault_id,
             ))
     }
@@ -12707,15 +12711,24 @@ impl TtlVaultContract {
         vault_id: u64,
         current_balance: i128,
     ) -> Result<bool, ContractError> {
-        if let Some(acceptance) = env
+        if let Some(response) = env
             .storage()
             .persistent()
-            .get::<StorageKey, BeneficiaryConditionalAcceptance>(
-                &StorageKey::BeneficiaryConditionalAcceptance(vault_id),
+            .get::<StorageKey, BeneficiaryConditionResponse>(
+                &StorageKey::BeneficiaryConditionResponse(vault_id),
             )
         {
-            if current_balance < acceptance.min_balance_threshold {
-                return Ok(false);
+            match response.response {
+                BeneficiaryConditionResponseType::Accept => {
+                    if current_balance < response.threshold {
+                        return Ok(false);
+                    }
+                }
+                BeneficiaryConditionResponseType::Decline => {
+                    if current_balance > response.threshold {
+                        return Ok(false);
+                    }
+                }
             }
         }
 

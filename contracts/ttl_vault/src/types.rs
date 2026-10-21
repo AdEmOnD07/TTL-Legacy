@@ -409,8 +409,7 @@ pub enum StorageKey {
     BeneficiaryDelegationChain(u64),
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
-    ConditionalAcceptance(u64),
-    ConditionalDecline(u64),
+    BeneficiaryConditionResponse(u64),
     ArchivedVault(u64),
     MaxTtlSeconds,
     TtlDecayRate,
@@ -570,7 +569,6 @@ pub enum StorageKey {
     AcceptanceConditions(u64),
     AdminTransferProposedAt,
     BeneficiaryClaimDelegation(u64),
-    BeneficiaryConditionalAcceptance(u64),
     BeneficiaryConflict(u64),
     // Issue #1297: automated conflict resolution
     /// Duration in seconds of the dispute window before auto-resolution.
@@ -1162,22 +1160,25 @@ pub struct ConditionalAcceptanceEntry {
     pub min_balance_threshold: Option<i128>,
 }
 
-/// Beneficiary conditional acceptance with threshold - Issue #503
+/// Discriminant for beneficiary condition response type.
 #[contracttype]
 #[derive(Clone)]
-pub struct BeneficiaryConditionalAcceptance {
-    pub min_balance_threshold: i128,
-    pub accepted_at: u64,
+pub enum BeneficiaryConditionResponseType {
+    Accept,
+    Decline,
 }
 
-/// Beneficiary conditional decline with threshold - Issue #503
-/// Allows beneficiary to decline vault assignment if balance is below a configurable minimum threshold
+/// Unified beneficiary conditional response with threshold - Issue #1849.
+/// Combines the former `BeneficiaryConditionalAcceptance` and
+/// `BeneficiaryConditionalDecline` into a single type with a
+/// `response: Accept | Decline` discriminant.
 #[contracttype]
 #[derive(Clone)]
-pub struct BeneficiaryConditionalDecline {
-    pub max_balance_threshold: i128,
-    pub declined_at: u64,
-    pub reason: String,
+pub struct BeneficiaryConditionResponse {
+    pub response: BeneficiaryConditionResponseType,
+    pub threshold: i128,
+    pub timestamp: u64,
+    pub reason: Option<String>,
 }
 
 /// Beneficiary delegation of claim rights to a trusted proxy address - Issue #944
