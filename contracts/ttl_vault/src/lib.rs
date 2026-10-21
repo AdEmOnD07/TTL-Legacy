@@ -5138,7 +5138,7 @@ impl TtlVaultContract {
         // Calculate payout: each installment = total / num_installments,
         // last installment absorbs remainder via vault.balance ceiling.
         let per_installment = schedule.total_amount / schedule.num_installments as i128;
-        let amount = if unlocked >= schedule.num_installments {
+        let base_amount = if unlocked >= schedule.num_installments {
             // Final batch: drain whatever remains in the vault attributed to this schedule
             let claimed_so_far = per_installment * schedule.claimed_installments as i128;
             schedule
@@ -5149,9 +5149,45 @@ impl TtlVaultContract {
             per_installment * claimable as i128
         };
 
-        if amount <= 0 {
+        if base_amount <= 0 {
             return Err(ContractError::NothingToClaimYet);
         }
+
+        // Issue #1756: apply late-claim penalty if VestingPenaltyConfig is set.
+        let amount = if let Some(penalty_cfg) = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, VestingPenaltyConfig>(&StorageKey::VestingPenalty(vault_id))
+        {
+            let late_cutoff = now.saturating_sub(penalty_cfg.grace_period_seconds);
+            let mut late_count = 0u32;
+            for i in (schedule.claimed_installments + 1)..=unlocked {
+                let unlock_time = schedule
+                    .start_time
+                    .saturating_add((i as u64 - 1).saturating_mul(schedule.interval));
+                if unlock_time < late_cutoff {
+                    late_count += 1;
+                }
+            }
+            if late_count > 0 {
+                let on_time_count = claimable.saturating_sub(late_count);
+                let on_time_amount = per_installment * on_time_count as i128;
+                let late_amount = per_installment * late_count as i128;
+                let penalty =
+                    late_amount * penalty_cfg.penalty_bps as i128 / BASIS_POINTS_100_PERCENT;
+                let penalized = on_time_amount + late_amount - penalty;
+                if unlocked >= schedule.num_installments {
+                    penalized.min(vault.balance)
+                } else {
+                    penalized
+                }
+            } else {
+                base_amount
+            }
+        } else {
+            base_amount
+        };
+
         if vault.balance < amount {
             return Err(ContractError::InsufficientBalance);
         }
@@ -5169,6 +5205,14 @@ impl TtlVaultContract {
 
         let token_client = token::Client::new(&env, &vault.token_address);
         token_client.transfer(&env.current_contract_address(), &beneficiary, &amount);
+
+        // Emit penalty event if the payout was reduced by the late-claim penalty.
+        if amount < base_amount {
+            env.events().publish(
+                (VESTING_PENALTY_TOPIC, vault_id),
+                (base_amount - amount, amount),
+            );
+        }
 
         env.storage()
             .instance()
