@@ -46,6 +46,7 @@ pub use types::{
     PROTOCOL_CONFIG_PROPOSED_TOPIC, PROXY_CLAIM_TOPIC, ProtocolConfig, ReleaseSchedule,
     ReleaseStatus, ReleaseTrigger, SET_BENEFICIARY_VESTING_TOPIC, SET_BURN_PERCENTAGE_TOPIC,
     SET_COUNTDOWN_TOPIC, TwoFactorConfigData, UNBIND_PASSKEY_BIOMETRIC_TOPIC,
+    SET_PASSKEY_BACKUP_ELIGIBLE_TOPIC,
     VESTING_ACCELERATED_TOPIC, VESTING_FINALIZED_TOPIC, VESTING_FORFEITURE_TOPIC,
     VESTING_PENALTY_TOPIC, VESTING_REVERSED_TOPIC, VESTING_ROLLOVER_TOPIC,
     VESTING_STAGGER_TOPIC, Vault, VaultSnapshot, WITHDRAWAL_ESCROW_CREATED_TOPIC,
@@ -590,6 +591,8 @@ pub enum ContractError {
     ReserveNotMet = 153,
     // Passkey rotation policy: the active passkey was rotated too recently.
     PasskeyRotationTooSoon = 154,
+    /// Passkey lockout triggered after exceeding failed attempt threshold (Issue #1847).
+    PasskeyLockoutTriggered = 155,
 }
 
 #[contract]
