@@ -19744,6 +19744,14 @@ impl TtlVaultContract {
 
             Self::save_vault(&env, vault_id, &vault);
             env.events().publish(
+                (CHECK_IN_RECORDED_TOPIC, vault_id),
+                CheckInEvent {
+                    vault_id,
+                    new_ttl: new_deadline,
+                    caller: caller.clone(),
+                },
+            );
+            env.events().publish(
                 (BATCH_CHECKIN_TOPIC, vault_id),
                 (now, extension, new_deadline),
             );
