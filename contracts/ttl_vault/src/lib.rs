@@ -332,6 +332,7 @@ mod min_checkin_interval_tests;
 // Issue #1264 #1265 #1266 #1267: dedicated guard tests
 #[cfg(test)]
 mod bug_fix_tests_1264_1265_1266_1267;
+mod release_conditions_query_tests;
 
 #[cfg(test)]
 mod vault_archiving_tests;
@@ -2193,7 +2194,12 @@ impl TtlVaultContract {
             vault.inactivity_penalty_bps,
             vault.penalty_recipient.clone(),
         ) {
-            let elapsed = now.saturating_sub(original_last_check_in);
+            // Hibernating time is not a missed check-in, so exclude it from the gap.
+            let hibernated =
+                Self::hibernated_seconds_between(&env, vault_id, original_last_check_in, now);
+            let elapsed = now
+                .saturating_sub(original_last_check_in)
+                .saturating_sub(hibernated);
             let missed = (elapsed / vault.check_in_interval).saturating_sub(1);
             if missed > 0 && vault.balance > 0 {
                 let penalty_per = vault.balance * (penalty_bps as i128) / BASIS_POINTS_100_PERCENT;
@@ -3563,7 +3569,7 @@ impl TtlVaultContract {
         }
 
         // Load release conditions
-        let conditions = Self::get_release_conditions(env.clone(), vault_id);
+        let conditions = Self::stored_release_conditions(&env, vault_id);
         let mut condition_met = false;
         let mut ttl_expiry_met = false;
 
@@ -9030,12 +9036,41 @@ impl TtlVaultContract {
     }
 
     /// Returns the release conditions attached to a vault.
-    /// Returns an empty vector if none have been set.
+    /// Vaults created before `set_release_conditions` existed have no stored
+    /// conditions and implicitly use `TTLExpiry`, so that is returned as the
+    /// default when nothing has been stored.
     pub fn get_release_conditions(env: Env, vault_id: u64) -> Vec<ReleaseCondition> {
         env.storage()
             .persistent()
             .get(&StorageKey::ReleaseConditions(vault_id))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| vec![&env, ReleaseCondition::TTLExpiry])
+    }
+
+    /// Returns only the conditions explicitly stored via `set_release_conditions`.
+    /// Empty when none were stored; trigger logic relies on this to fall back to
+    /// the vault's `release_condition` field.
+    fn stored_release_conditions(env: &Env, vault_id: u64) -> Vec<ReleaseCondition> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ReleaseConditions(vault_id))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Returns how many seconds of the interval `[from, to)` fall inside the
+    /// vault's hibernation window. Hibernating time must not count as missed
+    /// check-ins, so callers subtract this from elapsed time.
+    fn hibernated_seconds_between(env: &Env, vault_id: u64, from: u64, to: u64) -> u64 {
+        match env
+            .storage()
+            .persistent()
+            .get::<StorageKey, HibernationEntry>(&StorageKey::Hibernation(vault_id))
+        {
+            Some(h) => {
+                let window_end = h.started_at.saturating_add(h.duration_seconds);
+                to.min(window_end).saturating_sub(from.max(h.started_at))
+            }
+            None => 0,
+        }
     }
 
     /// Owner‑initiated panic release.
