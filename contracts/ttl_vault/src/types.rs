@@ -1183,6 +1183,15 @@ pub struct BeneficiaryConditionResponse {
     pub reason: Option<String>,
 }
 
+/// Unified beneficiary condition response - Issue #1849
+/// Represents either a conditional acceptance or conditional decline from a beneficiary
+#[contracttype]
+#[derive(Clone)]
+pub enum BeneficiaryConditionResponse {
+    Acceptance(BeneficiaryConditionalAcceptance),
+    Decline(BeneficiaryConditionalDecline),
+}
+
 /// Beneficiary delegation of claim rights to a trusted proxy address - Issue #944
 #[contracttype]
 #[derive(Clone)]

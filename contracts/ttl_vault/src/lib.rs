@@ -3672,8 +3672,8 @@ impl TtlVaultContract {
             }
         }
 
-        // Check beneficiary conditional acceptance threshold - Issue #503
-        if !Self::check_conditional_acceptance_threshold(&env, vault_id, total).unwrap_or(false) {
+        // Check beneficiary conditional acceptance/decline threshold - Issue #503, #1849
+        if !Self::check_beneficiary_condition_threshold(&env, vault_id, total).unwrap_or(false) {
             panic_with_error!(&env, ContractError::InsufficientBalance);
         }
 
@@ -12677,6 +12677,8 @@ impl TtlVaultContract {
             reason: None,
         };
 
+        let response = BeneficiaryConditionResponse::Acceptance(acceptance);
+
         env.storage().persistent().set(
             &StorageKey::BeneficiaryConditionResponse(vault_id),
             &response,
@@ -12747,6 +12749,8 @@ impl TtlVaultContract {
             timestamp: env.ledger().timestamp(),
             reason: Some(reason),
         };
+
+        let response = BeneficiaryConditionResponse::Decline(decline);
 
         env.storage()
             .persistent()
@@ -12835,6 +12839,38 @@ impl TtlVaultContract {
         }
 
         Ok(true)
+    }
+
+    // Backward compatibility wrappers for existing tests and external callers
+    /// @deprecated Use get_beneficiary_condition_response instead
+    pub fn get_beneficiary_cond_acceptance(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConditionalAcceptance> {
+        Self::get_beneficiary_condition_response(env, vault_id).and_then(|r| match r {
+            BeneficiaryConditionResponse::Acceptance(a) => Some(a),
+            _ => None,
+        })
+    }
+
+    /// @deprecated Use get_beneficiary_condition_response instead
+    pub fn get_beneficiary_cond_decline(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConditionalDecline> {
+        Self::get_beneficiary_condition_response(env, vault_id).and_then(|r| match r {
+            BeneficiaryConditionResponse::Decline(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    /// @deprecated Use check_beneficiary_condition_threshold instead
+    fn check_conditional_acceptance_threshold(
+        env: &Env,
+        vault_id: u64,
+        current_balance: i128,
+    ) -> Result<bool, ContractError> {
+        Self::check_beneficiary_condition_threshold(env, vault_id, current_balance)
     }
 
     /// Sets escalating acceptance conditions for a vault's beneficiary release.
