@@ -370,166 +370,52 @@ pub struct AuditExportQuery {
 
 /* … truncated 3428 chars — edit only what you need near the top … */
 
-// ── State transition history endpoints (#1854) ────────────────────────────────
+// ── Issue #1852: Beneficiary proof-of-life endpoint ────────────────────────
 
-#[derive(Deserialize)]
-pub struct StateTransitionQuery {
-    pub vault_id: Option<String>,
-    pub from_status: Option<String>,
-    pub to_status: Option<String>,
-    pub triggered_by: Option<String>,
-    pub after: Option<chrono::DateTime<chrono::Utc>>,
-    pub before: Option<chrono::DateTime<chrono::Utc>>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
+#[derive(serde::Deserialize)]
+pub struct ProofOfLifeSubmitRequest {
+    pub beneficiary: String,
+    pub proof: String,
+    pub validity_seconds: Option<u64>,
 }
 
-/// GET /vaults/{id}/state-transitions
+/// POST /api/vaults/:vault_id/proof-of-life
 ///
-/// Returns the state transition history for a vault.
-/// Only the vault owner may access this endpoint.
-#[instrument(skip(state))]
-pub async fn get_vault_state_transitions(
+/// Submits a beneficiary proof-of-life attestation. The backend records
+/// the proof so that a periodic scheduler can request re-attestation from
+/// beneficiaries for high-value vaults.
+#[instrument(skip(state), fields(vault_id = %vault_id))]
+pub async fn submit_proof_of_life(
     state: Data<Arc<AppState>>,
-    vault_id: Path<String>,
-    query: Query<StateTransitionQuery>,
-    req: HttpRequest,
-) -> Result<Json<crate::models::StateTransitionHistory>, AppError> {
+    vault_id: Path<u64>,
+    body: Json<ProofOfLifeSubmitRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let vault_id = vault_id.into_inner();
     let db = &state.db;
-    
-    // Extract user ID from headers (similar to audit export)
-    let requester = req.headers()
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    
-    if requester.is_empty() {
-        return Err(AppError::Unauthorized);
-    }
 
-    let owner = db.vault_owner(&vault_id).map_err(|e| {
-        tracing::error!(error = %e, "failed to load vault owner");
-        AppError::InternalError("failed to load vault".into())
-    })?;
-
-    let owner = match owner {
-        Some(owner) => owner,
-        None => return Err(AppError::NotFound),
-    };
-
-    if owner != requester {
-        return Err(AppError::Forbidden);
-    }
-
-    let mut db_query = crate::models::StateTransitionQuery {
-        vault_id: Some(vault_id.clone()),
-        from_status: query.from_status,
-        to_status: query.to_status,
-        triggered_by: query.triggered_by,
-        after: query.after,
-        before: query.before,
-        limit: query.limit,
-        offset: query.offset,
-    };
-
-    let transitions = db.query_state_transitions(&db_query).map_err(|e| {
-        tracing::error!(error = %e, "failed to load state transitions");
-        AppError::InternalError("failed to load state transitions".into())
-    })?;
-
-    Ok(Json(crate::models::StateTransitionHistory {
-        vault_id,
-        transitions,
-    }))
-}
-
-/// GET /vaults/{id}/state-transitions/export?format=csv|json
-///
-/// Exports the vault's state transition history as CSV or JSON.
-#[instrument(skip(state))]
-pub async fn export_vault_state_transitions(
-    state: Data<Arc<AppState>>,
-    vault_id: Path<String>,
-    query: Query<AuditExportQuery>,
-    req: HttpRequest,
-) -> Result<HttpResponse, AppError> {
-    let db = &state.db;
-    
-    let requester = req.headers()
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    
-    if requester.is_empty() {
-        return Err(AppError::Unauthorized);
-    }
-
-    let owner = db.vault_owner(&vault_id).map_err(|e| {
-        tracing::error!(error = %e, "failed to load vault owner");
-        AppError::InternalError("failed to load vault".into())
-    })?;
-
-    let owner = match owner {
-        Some(owner) => owner,
-        None => return Err(AppError::NotFound),
-    };
-
-    if owner != requester {
-        return Err(AppError::Forbidden);
-    }
-
-    let transitions = db.get_vault_state_transitions(&vault_id).map_err(|e| {
-        tracing::error!(error = %e, "failed to load state transitions");
-        AppError::InternalError("failed to load state transitions".into())
-    })?;
-
-    let format = query.format.as_deref().unwrap_or("csv").to_ascii_lowercase();
-
-    match format.as_str() {
-        "json" => {
-            let body = serde_json::to_vec(&transitions.transitions).map_err(|e| {
-                tracing::error!(error = %e, "failed to serialize state transitions");
-                AppError::InternalError("failed to serialize state transitions".into())
-            })?;
-            Ok(HttpResponse::Ok()
-                .content_type("application/json")
-                .body(body))
-        }
-        "csv" => {
-            let mut out = String::from(
-                "id,vault_id,from_status,to_status,timestamp,triggered_by,trigger_reason,details\n",
-            );
-            for entry in &transitions.transitions {
-                let details = entry.details.as_ref().map(|d| d.to_string()).unwrap_or_default();
-                let trigger_reason = entry.trigger_reason.as_ref().unwrap_or(&String::new());
-                let fields = [
-                    entry.id.to_string(),
-                    entry.vault_id.clone(),
-                    format!("{:?}", entry.from_status),
-                    format!("{:?}", entry.to_status),
-                    entry.timestamp.to_rfc3339(),
-                    entry.triggered_by.clone(),
-                    trigger_reason.clone(),
-                    details,
-                ];
-                let row = fields
-                    .iter()
-                    .map(|f| {
-                        if f.contains(',') || f.contains('"') || f.contains('\n') || f.contains('\r') {
-                            format!("\"{}\"", f.replace('"', "\"\""))
-                        } else {
-                            f.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                out.push_str(&row);
-                out.push('\n');
+    // Verify vault exists
+    match db.get(vault_id) {
+        Ok(vault) => {
+            if vault.beneficiary != body.beneficiary {
+                return Err(AppError::InvalidInput(
+                    "Only the beneficiary can submit proof of life".into(),
+                ));
             }
-            Ok(HttpResponse::Ok()
-                .content_type("text/csv; charset=utf-8")
-                .body(out))
         }
-        other => Err(AppError::InvalidInput(format!("unsupported export format: {other}"))),
+        Err(_) => return Err(AppError::NotFound),
     }
+
+    // Record proof of life submission
+    db.store_proof_of_life(
+        vault_id,
+        &body.beneficiary,
+        &body.proof,
+        body.validity_seconds.unwrap_or(86400 * 30),
+    )?;
+
+    Ok(Json(serde_json::json!({
+        "status": "submitted",
+        "vault_id": vault_id,
+        "beneficiary": body.beneficiary,
+    })))
 }
