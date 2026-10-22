@@ -2162,7 +2162,9 @@ impl TtlVaultContract {
 
         // Issue #1283: on-chain secp256r1 signature verification.
         // If a public key is registered for this passkey, verify the signature.
-        Self::verify_passkey_signature(&env, vault_id, &passkey_hash, &signature, &message)?;
+        if let Err(e) = Self::verify_passkey_signature(&env, vault_id, &passkey_hash, &signature, &message) {
+            return Err(Self::record_passkey_failure(&env, vault_id, &passkey_hash, e));
+        }
 
         vault.last_check_in = now;
         // Apply scheduled beneficiary rotation if effective timestamp has passed
@@ -2636,7 +2638,7 @@ impl TtlVaultContract {
                     false,
                     "Invalid passkey signature",
                 );
-                return Err(e);
+                return Err(Self::record_passkey_failure(&env, vault_id, pk_hash, e));
             }
         }
 
@@ -8153,7 +8155,9 @@ impl TtlVaultContract {
         // Beneficiary updates are high-value actions — enforce sig when a
         // public key is registered for the supplied passkey_hash.
         if let Some(ref pk_hash) = passkey_hash {
-            Self::verify_passkey_signature(&env, vault_id, pk_hash, &signature, &message)?;
+            if let Err(e) = Self::verify_passkey_signature(&env, vault_id, pk_hash, &signature, &message) {
+                return Err(Self::record_passkey_failure(&env, vault_id, pk_hash, e));
+            }
         }
 
         if vault.owner == new_beneficiary {
@@ -9998,6 +10002,7 @@ impl TtlVaultContract {
         env: Env,
         vault_id: u64,
         duration_seconds: u64,
+        threshold: u32,
     ) -> Result<(), ContractError> {
         let vault = Self::load_vault(&env, vault_id);
         vault.owner.require_auth();
@@ -10005,12 +10010,13 @@ impl TtlVaultContract {
             locked_at: env.ledger().timestamp(),
             unlock_at: env.ledger().timestamp() + duration_seconds,
             failed_attempts: 0,
+            threshold,
         };
         env.storage()
             .persistent()
             .set(&StorageKey::PasskeyLockout(vault_id), &lockout);
         env.events()
-            .publish((PASSKEY_LOCKOUT_TOPIC, vault_id), duration_seconds);
+            .publish((PASSKEY_LOCKOUT_TOPIC, vault_id), (duration_seconds, threshold));
         Ok(())
     }
 
@@ -10946,6 +10952,44 @@ impl TtlVaultContract {
         Ok(())
     }
 
+    /// Records a failed passkey verification attempt and triggers lockout if threshold exceeded.
+    /// Returns the original error, or ContractError::PasskeyLockoutTriggered if lockout activated.
+    fn record_passkey_failure(
+        env: &Env,
+        vault_id: u64,
+        passkey_hash: &BytesN<32>,
+        original_error: ContractError,
+    ) -> ContractError {
+        // Get or create lockout record
+        let lockout_key = StorageKey::PasskeyLockout(vault_id);
+        let mut lockout: PasskeyLockout = match env.storage().persistent().get(&lockout_key) {
+            Some(l) => l,
+            None => {
+                // No lockout config exists, return original error without tracking
+                return original_error;
+            }
+        };
+
+        lockout.failed_attempts += 1;
+
+        // Check if threshold exceeded
+        if lockout.threshold > 0 && lockout.failed_attempts >= lockout.threshold {
+            // Trigger auto-lockout for 1 hour
+            lockout.locked_at = env.ledger().timestamp();
+            lockout.unlock_at = env.ledger().timestamp() + 3600; // 1 hour
+            env.storage().persistent().set(&lockout_key, &lockout);
+            env.events().publish(
+                (PASSKEY_LOCKOUT_TOPIC, vault_id),
+                (lockout.locked_at, lockout.unlock_at, lockout.failed_attempts, lockout.threshold),
+            );
+            return ContractError::PasskeyLockoutTriggered;
+        }
+
+        // Persist updated failed_attempts
+        env.storage().persistent().set(&lockout_key, &lockout);
+        original_error
+    }
+
     // --- Issue #395 & #937: Passkey Usage Analytics ---
 
     /// Logs a passkey usage entry for a vault check-in and runs anomaly detection.
@@ -11702,6 +11746,7 @@ impl TtlVaultContract {
         vault_id: u64,
         caller: Address,
         passkey_hash: BytesN<32>,
+        backup_eligible: bool,
     ) -> Result<(), ContractError> {
         caller.require_auth();
         let vault = Self::load_vault(&env, vault_id);
@@ -11739,7 +11784,7 @@ impl TtlVaultContract {
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
-            .publish((ADD_PASSKEY_TOPIC, vault_id), passkey_hash);
+            .publish((ADD_PASSKEY_TOPIC, vault_id), (passkey_hash, backup_eligible));
         Ok(())
     }
 
@@ -11896,6 +11941,63 @@ impl TtlVaultContract {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events()
             .publish((UNBIND_PASSKEY_BIOMETRIC_TOPIC, vault_id), passkey_hash);
+        Ok(())
+    }
+
+    /// Updates the backup eligibility flag for a registered passkey.
+    ///
+    /// Only the vault owner can call this. This flag indicates whether the
+    /// WebAuthn credential is eligible for cloud backup/sync (e.g., iCloud Keychain,
+    /// Google Password Manager). Setting to false means the credential is device-bound
+    /// and cannot be synced across devices.
+    pub fn set_passkey_backup_eligible(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+        backup_eligible: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let key = StorageKey::VaultPasskeys(vault_id);
+        let mut passkeys: Vec<PasskeyHash> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        let mut found = false;
+        for i in 0..passkeys.len() {
+            if let Some(mut pk) = passkeys.get(i) {
+                if pk.hash == passkey_hash {
+                    pk.backup_eligible = backup_eligible;
+                    passkeys.set(i, pk);
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if !found {
+            return Err(ContractError::PasskeyNotFound);
+        }
+
+        env.storage().persistent().set(&key, &passkeys);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events()
+            .publish((SET_PASSKEY_BACKUP_ELIGIBLE_TOPIC, vault_id), (passkey_hash, backup_eligible));
         Ok(())
     }
 
